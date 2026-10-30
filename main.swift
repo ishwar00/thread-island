@@ -33,20 +33,10 @@ func runThreads(_ args: [String], input: Data? = nil) -> Data {
     return data
 }
 
-/// A moment worth surfacing in the collapsed island: a thread started needing you, or finished working.
-struct Alert: Equatable {
-    let row: Row
-    let label: String
-    let color: Color
-    static func == (a: Alert, b: Alert) -> Bool { a.row.key == b.row.key && a.label == b.label }
-}
-
 final class Store: ObservableObject {
     @Published var rows: [Row] = []
     @Published var errors: [String] = []
-    var onAlert: (Alert) -> Void = { _ in }
     private var loading = false
-    private var lastStates: [String: String]?  // nil until the first load, so startup doesn't alert
 
     func refresh() {
         guard !loading else { return }
@@ -60,24 +50,8 @@ final class Store: ObservableObject {
                     self.errors = ["threads script: no readable output (\(data.count) bytes)"]
                     return
                 }
-                self.detectAlerts(payload.rows)
                 self.rows = payload.rows
                 self.errors = payload.errors
-            }
-        }
-    }
-
-    private func detectAlerts(_ rows: [Row]) {
-        defer { lastStates = Dictionary(rows.map { ($0.key, $0.state) }, uniquingKeysWith: { a, _ in a }) }
-        guard let before = lastStates else { return }
-        for row in rows {
-            let was = before[row.key]
-            if row.state == "needs you" && was != "needs you" {
-                return onAlert(Alert(row: row, label: "Needs you", color: .orange))
-            }
-            if was == "working" && row.state != "working" && row.state != "needs you" {
-                return onAlert(Alert(row: row, label: row.state == "failed" ? "Failed" : "Done",
-                                     color: row.state == "failed" ? .red : .green))
             }
         }
     }
@@ -113,22 +87,19 @@ func appIcon(_ row: Row, size: CGFloat) -> some View {
 struct IslandView: View {
     @ObservedObject var store: Store
     let expanded: Bool
-    let alert: Alert?
     let notch: CGSize
     let onPick: (Row) -> Void
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
-                if let alert, !expanded { alertWings(alert) } else { badgeWings }
+                badgeWings
             }
             .frame(height: notch.height)
             if expanded { list }
         }
         .background(UnevenRoundedRectangle(bottomLeadingRadius: expanded ? 22 : 12,
                                            bottomTrailingRadius: expanded ? 22 : 12).fill(.black))
-        .contentShape(Rectangle())
-        .onTapGesture { if let alert, !expanded { onPick(alert.row) } }
         .contextMenu { Button("Quit ThreadIsland") { NSApp.terminate(nil) } }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
@@ -143,25 +114,6 @@ struct IslandView: View {
         .frame(maxWidth: .infinity)
         Spacer().frame(width: notch.width)
         badge(store.working, .green).frame(maxWidth: .infinity)
-    }
-
-    // The notch hides the middle, so the alert lives in the wings: who on the left, what happened on the right
-    @ViewBuilder func alertWings(_ alert: Alert) -> some View {
-        HStack(spacing: 7) {
-            appIcon(alert.row, size: 18)
-            Text(alert.row.title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
-            Spacer(minLength: 0)
-        }
-        .padding(.leading, 14)
-        .frame(maxWidth: .infinity)
-        Spacer().frame(width: notch.width)
-        HStack(spacing: 5) {
-            Spacer(minLength: 0)
-            Circle().fill(alert.color).frame(width: 7, height: 7)
-            Text(alert.label).font(.system(size: 12, weight: .semibold)).foregroundStyle(alert.color)
-        }
-        .padding(.trailing, 14)
-        .frame(maxWidth: .infinity)
     }
 
     func badge(_ n: Int, _ color: Color) -> some View {
@@ -253,12 +205,15 @@ struct RowView: View {
 // Non-key panel: take the first click, and track hover even when another app is active.
 final class HoverHostingView<V: View>: NSHostingView<V> {
     var onHover: (Bool) -> Void = { _ in }
+    private var area: NSTrackingArea?
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
-        trackingAreas.filter { $0.owner === self }.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                       owner: self))
+        // remove only our own area: SwiftUI's per-row hover areas are on this view too
+        if let area { removeTrackingArea(area) }
+        let a = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(a)
+        area = a
     }
     override func mouseEntered(with event: NSEvent) { onHover(true) }
     override func mouseExited(with event: NSEvent) { onHover(false) }
@@ -269,27 +224,25 @@ final class Island: NSObject {
     let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     var host: HoverHostingView<IslandView>!
     var expanded = false
-    var alert: Alert?
     var notch = CGSize(width: 180, height: 32)
     var hoverWork: DispatchWorkItem?
-    var alertWork: DispatchWorkItem?
     var ticks = 0
-    let wing: CGFloat = 44, alertWing: CGFloat = 190, expandedSize = CGSize(width: 520, height: 480)
+    let wing: CGFloat = 44, expandedSize = CGSize(width: 520, height: 480)
 
     func start() {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
+        panel.acceptsMouseMovedEvents = true  // row hover in a non-key panel
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         host = HoverHostingView(rootView: view())
         host.onHover = { [weak self] inside in self?.hovered(inside) }
         panel.contentView = host
-        store.onAlert = { [weak self] alert in self?.show(alert) }
         layout()
         panel.orderFrontRegardless()
         store.refresh()
-        // ponytail: polls the script (~0.5s CPU per run): every 4s while open, every 12s collapsed (alert latency)
+        // ponytail: polls the script (~0.5s CPU per run): every 4s while open, every 12s collapsed (for the counts)
         Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.ticks += 1
@@ -300,23 +253,10 @@ final class Island: NSObject {
     }
 
     func view() -> IslandView {
-        IslandView(store: store, expanded: expanded, alert: alert, notch: notch) { [weak self] row in
+        IslandView(store: store, expanded: expanded, notch: notch) { [weak self] row in
             self?.store.jump(row)
-            self?.alert = nil
             self?.setExpanded(false)
         }
-    }
-
-    func show(_ alert: Alert) {
-        self.alert = alert
-        alertWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            self?.alert = nil
-            self?.layout()
-        }
-        alertWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
-        layout()
     }
 
     func hovered(_ inside: Bool) {
@@ -342,7 +282,7 @@ final class Island: NSObject {
             notch = CGSize(width: 180, height: NSStatusBar.system.thickness)
         }
         let size = expanded ? expandedSize
-            : CGSize(width: notch.width + 2 * (alert == nil ? wing : alertWing), height: notch.height)
+            : CGSize(width: notch.width + 2 * wing, height: notch.height)
         let f = screen.frame
         let frame = NSRect(x: f.midX - size.width / 2, y: f.maxY - size.height, width: size.width, height: size.height)
         host.rootView = view()

@@ -11,8 +11,6 @@ Codex's own activity view orders them.
 
 - **Collapsed:** a black pill around the notch. The left side counts threads that need you (orange),
   the right side counts threads that are working (green).
-- **Alerts:** when a thread starts to need you, or a working thread finishes, the pill widens for six
-  seconds and shows which one. Click it to go there.
 - **Expanded (hover):** a **Priority** section first (needs you, then working), then **Today**,
   **Yesterday** and one section per weekday for the last 7 days. Each row starts with the app icon,
   so you can scan for "the Codex one" by color, and the age is right under the title.
@@ -49,7 +47,7 @@ Right-click the island to quit.
 
 `threads` (Python, standard library only) gathers every source into one JSON list, and `threads --jump`
 opens one row. `main.swift` is only the UI: a borderless panel at the notch that runs `threads` every
-12 s (every 4 s while open) and diffs states to raise alerts.
+12 s (every 4 s while open). It never pops up on its own: you look when you want to.
 
 Run `threads` yourself to see the raw data.
 
