@@ -11,10 +11,13 @@ Codex's own activity view orders them.
 
 - **Collapsed:** a black pill around the notch. The left side counts threads that need you,
   the right side counts threads that are working.
-- **Expanded (hover):** a **Priority** section first (needs you, then working), then **Today**,
-  **Yesterday** and one section per weekday for the last 7 days. Like Codex, threads sort by when you
-  last sent a message, so agent activity never reshuffles the list and positions stay where you learned
-  them. Each row starts with the app icon, so you can scan for "the Codex one", and shows its age.
+- **Expanded (hover):** a **Priority** section first, then **Today**, **Yesterday** and one section per
+  weekday for the last 7 days. Rows never swap places, so positions stay where you learned them:
+  - **Priority** holds threads that are working, need you, or were active in the last 2 hours, oldest
+    created on top. A new thread joins at the bottom; a thread idle for 2 hours drops into its day.
+  - **Day sections** sort by when you last sent a message.
+
+  Each row starts with the app icon, so you can scan for "the Codex one", and shows its age.
 - **Design:** right-click the island to pick one of three designs: Instrument (state lamps in one
   column), Ink (serif titles, age in the margin) or Tide (rounded type, state ring around the icon).
   Nothing moves unless you hover.
