@@ -13,8 +13,9 @@ Codex's own activity view orders them.
   the right side counts threads that are working.
 - **Expanded (hover):** a **Priority** section first, then **Today**, **Yesterday** and one section per
   weekday for the last 7 days. Rows never swap places, so positions stay where you learned them:
-  - **Priority** holds threads that are working, need you, or were active in the last 2 hours, oldest
-    created on top. A new thread joins at the bottom; a thread idle for 2 hours drops into its day.
+  - **Priority** holds threads that are working, need you, or were active in the last 2 hours, in the
+    order they became active. A thread that becomes active, new or old, joins at the bottom; a thread
+    idle for 2 hours drops into its day.
   - **Day sections** sort by when you last sent a message.
 
   Each row starts with the app icon, so you can scan for "the Codex one", and shows its age.

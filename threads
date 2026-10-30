@@ -152,7 +152,7 @@ def codex_rows(procs, gtty):
             rows.append(row(tid, rec_ms / 1000, src, state, title, detail, 'url', f'codex://threads/{tid}'))
         else:
             rows.append(row(tid, rec_ms / 1000, src, state, title, detail, 'tab', f'codex resume {tid}', cwd))
-        rows[-1].update(active=(upd_ms or rec_ms) / 1000, created=(created_ms or rec_ms) / 1000)
+        rows[-1].update(active=(upd_ms or rec_ms) / 1000, created=(created_ms or rec_ms) / 1000, log=('codex', rollout))
     return rows
 
 
@@ -175,40 +175,83 @@ def claude_desktop_rows():
         rows.append(row(d['sessionId'], ts, 'claude-app', state, d.get('title') or '(untitled)',
                         summary.get('status_detail') or d.get('cwd', ''),
                         'url', f"claude://code/continue?session={d['sessionId']}"))
-        rows[-1].update(active=(d.get('lastActivityAt') or 0) / 1000, created=(d.get('createdAt') or 0) / 1000)
+        rows[-1].update(active=(d.get('lastActivityAt') or 0) / 1000, created=(d.get('createdAt') or 0) / 1000,
+                        log=('claude', transcript_path(d.get('cliSessionId'))))
     return rows
 
 
-def last_record(buf, marker, rtype):
-    """Last JSON line in buf that contains marker and has type rtype. Searches the raw bytes backwards, so
-    only matching lines are decoded (decoding and splitting whole tails peaked at 150 MB)."""
+def records(buf, marker):
+    """JSON lines in buf that contain marker, newest first. Searches the raw bytes backwards, so only
+    matching lines are decoded (decoding and splitting whole tails peaked at 150 MB)."""
     end = len(buf)
     while (i := buf.rfind(marker, 0, end)) != -1:
         start = buf.rfind(b'\n', 0, i) + 1
         stop = buf.find(b'\n', i)
         try:
-            rec = json.loads(buf[start:stop if stop != -1 else len(buf)])
-            if rec.get('type') == rtype:
-                return rec
+            yield json.loads(buf[start:stop if stop != -1 else len(buf)])
         except ValueError:  # the tail's first line may be cut off
             pass
         end = start
-    return None
+
+
+def last_record(buf, marker, rtype):
+    return next((r for r in records(buf, marker) if r.get('type') == rtype), None)
+
+
+def transcript_path(session_id):
+    paths = glob.glob(f'{HOME}/.claude/projects/*/{session_id}.jsonl') if session_id else []
+    return paths[0] if paths else None
+
+
+# Where each source records a turn: Claude marks the messages you type, Codex logs every turn start
+TURNS = {
+    'claude': (b'"origin":{"kind":"human"}', lambda r: r.get('type') == 'user'),
+    'codex': (b'"type":"task_started"', lambda r: (r.get('payload') or {}).get('type') == 'task_started'),
+}
+
+
+def streak_start(kind, path):
+    """When the thread's current run of activity began: its first turn after a gap of IDLE_OUT or more,
+    else its first turn. Reads the log backwards in 4 MB chunks only until that gap, so memory stays at
+    one chunk however long the log is."""
+    marker, is_turn = TURNS[kind]
+    chunk, start, carry = 4 * 1024 * 1024, None, b''
+    try:
+        with open(path, 'rb') as fh:
+            pos = os.path.getsize(path)
+            while pos > 0:
+                n = min(chunk, pos)
+                pos -= n
+                fh.seek(pos)
+                buf = fh.read(n) + carry
+                # the first line may continue in the previous chunk: keep it for the next round
+                cut = buf.find(b'\n') if pos > 0 else -1
+                carry, buf = (buf[:cut + 1], buf[cut + 1:]) if cut != -1 else (b'', buf)
+                for rec in records(buf, marker):
+                    if not is_turn(rec) or not rec.get('timestamp'):
+                        continue
+                    t = epoch(rec['timestamp'])
+                    if start is not None and start - t >= IDLE_OUT:
+                        return start
+                    start = t
+    except (OSError, ValueError):
+        pass
+    return start
 
 
 def transcript_info(session_id):
     """(title, time of your last message) from the end of a Claude transcript. The title is the latest
     rename, else the latest AI title. Rows sort on your last message, like Codex's recency_at, so agent
     activity doesn't reshuffle the list."""
-    paths = glob.glob(f'{HOME}/.claude/projects/*/{session_id}.jsonl')
-    if not paths:
+    path = transcript_path(session_id)
+    if not path:
         return None, None
-    size = os.path.getsize(paths[0])
+    size = os.path.getsize(path)
     custom = ai = sent = None
     # ponytail: tail reads (transcripts reach 100+ MB); an agent that wrote more than 8 MB since your
     # last message falls back to activity time
     for span in (512 * 1024, 8 * 1024 * 1024):
-        with open(paths[0], 'rb') as fh:
+        with open(path, 'rb') as fh:
             fh.seek(max(0, size - span))
             tail = fh.read()
         custom = custom or last_record(tail, b'"type":"custom-title"', 'custom-title')
@@ -271,7 +314,8 @@ def claude_cli_rows(procs, gtty):
             rows.append(row(jid, ts, 'claude-bg', state, title, d.get('detail') or '', 'tab',
                             f'claude attach {jid}', d.get('cwd') or HOME))
         created = d.get('createdAt')
-        rows[-1].update(active=os.path.getmtime(f), created=epoch(created) if created else os.path.getmtime(f))
+        rows[-1].update(active=os.path.getmtime(f), created=epoch(created) if created else os.path.getmtime(f),
+                        log=('claude', transcript_path(d.get('sessionId'))))
 
     for d in live:
         # agent-view windows aren't threads; the jobs they show are listed above
@@ -286,7 +330,7 @@ def claude_cli_rows(procs, gtty):
         # other terminals (Terminal.app, iTerm2, ...) aren't supported yet: the row shows but doesn't jump
         rows.append(row(d['sessionId'], ts, 'claude-cli', state, title, d.get('cwd', ''), *(target or ('none', ''))))
         rows[-1].update(active=(d.get('updatedAt') or d.get('startedAt') or 0) / 1000,
-                        created=(d.get('startedAt') or 0) / 1000)
+                        created=(d.get('startedAt') or 0) / 1000, log=('claude', transcript_path(d['sessionId'])))
     return rows
 
 
@@ -344,12 +388,18 @@ def jump(r):
 
 def sectioned(rows):
     """Positions are learned, so rows never swap, and nothing needs remembering between runs:
-    Priority holds threads that are active or were active in the last 2 h, oldest-created on top, so a new
-    thread joins at the bottom and a returning one takes back its old slot. Day sections sort by your last
-    message, which can't change there: a new message makes a thread active, and it moves to Priority."""
+    Priority holds threads that are active or were active in the last 2 h, in the order their current run
+    of activity began, so a thread that becomes active (new or not) joins at the bottom. Day sections sort
+    by your last message, which can't change there: a new message makes a thread active, and it moves to
+    Priority."""
     def hot(r):
         return r['state'] in ACTIVE or NOW - r.get('active', 0) < IDLE_OUT
-    priority = sorted((r for r in rows if hot(r)), key=lambda r: r.get('created', r['ts']))
+    for r in rows:
+        kind, path = r.pop('log', (None, None))
+        if path and hot(r):
+            r['entered'] = streak_start(kind, path)
+    priority = sorted((r for r in rows if hot(r)),
+                      key=lambda r: r.get('entered') or r.get('created') or r['ts'])
     # the 7-day window applies to sort time (your last message), which can be older than a source's file mtime
     recent = sorted((r for r in rows if not hot(r) and r['ts'] >= CUTOFF), key=lambda r: -r['ts'])
     for r in priority:
