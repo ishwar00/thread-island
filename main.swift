@@ -65,13 +65,52 @@ final class Store: ObservableObject {
     var working: Int { rows.filter { $0.state == "working" }.count }
 }
 
-func stateColor(_ state: String) -> Color {
-    switch state {
-    case "needs you": return .orange
-    case "working": return .green
-    case "failed": return .red
-    default: return .gray.opacity(0.5)
+extension Color {
+    init(hex: UInt32) {
+        self.init(red: Double(hex >> 16 & 0xFF) / 255, green: Double(hex >> 8 & 0xFF) / 255, blue: Double(hex & 0xFF) / 255)
     }
+}
+
+// A design system: every color and type style a view may use. Color means state, nothing else.
+struct Design {
+    enum Marker { case lamp, margin, halo }  // where a row shows its state: one signature per design
+    let name: String
+    let text, detail, needsYou, working, failed: Color
+    let title, small, header, age: Font
+    let marker: Marker
+
+    func color(_ state: String) -> Color? {
+        switch state {
+        case "needs you": return needsYou
+        case "working": return working
+        case "failed": return failed
+        default: return nil
+        }
+    }
+
+    // Instrument: a calm, single-purpose instrument panel; state lamps in one column at the left edge
+    static let instrument = Design(
+        name: "Instrument", text: Color(hex: 0xECEAE4), detail: Color(hex: 0x8E8C86),
+        needsYou: Color(hex: 0xFF6A13), working: Color(hex: 0x86B35E), failed: Color(hex: 0xE5484D),
+        title: .system(size: 13, weight: .medium), small: .system(size: 11),
+        header: .system(size: 11, weight: .semibold), age: .system(size: 11).monospacedDigit(), marker: .lamp)
+    // Ink: threads as correspondence; serif titles, the age in the margin like a letter's date
+    static let ink = Design(
+        name: "Ink", text: Color(hex: 0xEDE8DF), detail: Color(hex: 0x8A857C),
+        needsYou: Color(hex: 0xC8423B), working: Color(hex: 0x6E9E8A), failed: Color(hex: 0xC8423B),
+        title: .system(size: 14, design: .serif), small: .system(size: 11),
+        header: .system(size: 12, weight: .semibold, design: .serif), age: .system(size: 11, design: .serif).italic(),
+        marker: .margin)
+    // Tide: sea glass on black water; rounded type, state as a still ring around the app icon
+    static let tide = Design(
+        name: "Tide", text: Color(hex: 0xE6F0F0), detail: Color(hex: 0x7E9298),
+        needsYou: Color(hex: 0xF2C879), working: Color(hex: 0x7FD1C1), failed: Color(hex: 0xF08A7E),
+        title: .system(size: 13, weight: .semibold, design: .rounded), small: .system(size: 11, design: .rounded),
+        header: .system(size: 11, weight: .semibold, design: .rounded), age: .system(size: 11, design: .rounded).monospacedDigit(),
+        marker: .halo)
+
+    static let all = [instrument, ink, tide]
+    static func named(_ name: String) -> Design { all.first { $0.name == name } ?? instrument }
 }
 
 // Real app icons, so the source is readable at a glance on the left edge
@@ -84,78 +123,94 @@ func appIcon(_ row: Row, size: CGFloat) -> some View {
         .resizable().interpolation(.high).frame(width: size, height: size)
 }
 
+final class IslandState: ObservableObject {
+    @Published var expanded = false
+}
+
 struct IslandView: View {
     @ObservedObject var store: Store
-    let expanded: Bool
-    let notch: CGSize
+    @ObservedObject var state: IslandState
+    @AppStorage("design") var designName = Design.instrument.name
+    let notch: CGSize, collapsed: CGSize, full: CGSize
     let onPick: (Row) -> Void
 
+    var design: Design { Design.named(designName) }
+
     var body: some View {
+        let size = state.expanded ? full : collapsed
+        let radius: CGFloat = state.expanded ? 20 : 12  // rows: 10 radius + 10 inset, so corners nest
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 badgeWings
             }
             .frame(height: notch.height)
-            if expanded { list }
+            if state.expanded { list.transition(.opacity) }
         }
-        .background(UnevenRoundedRectangle(bottomLeadingRadius: expanded ? 22 : 12,
-                                           bottomTrailingRadius: expanded ? 22 : 12).fill(.black))
-        .contextMenu { Button("Quit ThreadIsland") { NSApp.terminate(nil) } }
+        .frame(width: size.width, height: size.height, alignment: .top)
+        .background(.black)
+        .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: radius, bottomTrailingRadius: radius))
+        .contextMenu {
+            Picker("Design", selection: $designName) {
+                ForEach(Design.all, id: \.name) { Text($0.name).tag($0.name) }
+            }
+            Button("Quit ThreadIsland") { NSApp.terminate(nil) }
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     @ViewBuilder var badgeWings: some View {
         HStack(spacing: 6) {
             if !store.errors.isEmpty {
-                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 9)).foregroundStyle(.red)
+                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 9)).foregroundStyle(design.failed)
             }
-            badge(store.needsYou, .orange)
+            badge(store.needsYou, design.needsYou)
         }
         .frame(maxWidth: .infinity)
         Spacer().frame(width: notch.width)
-        badge(store.working, .green).frame(maxWidth: .infinity)
+        badge(store.working, design.working).frame(maxWidth: .infinity)
     }
 
     func badge(_ n: Int, _ color: Color) -> some View {
         HStack(spacing: 4) {
             if n > 0 {
                 Circle().fill(color).frame(width: 7, height: 7)
-                Text("\(n)").font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
+                Text("\(n)").font(design.small.weight(.semibold)).monospacedDigit().foregroundStyle(design.text)
             }
         }
     }
 
     var list: some View {
         ScrollView {
-            LazyVStack(spacing: 2) {
+            LazyVStack(spacing: 0) {
                 ForEach(store.errors, id: \.self) { error in
                     Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 11)).foregroundStyle(.red.opacity(0.9)).lineLimit(2)
+                        .font(design.small).foregroundStyle(design.failed).lineLimit(2)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10).padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(.red.opacity(0.12)))
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(design.failed.opacity(0.12)))
                 }
                 if store.rows.isEmpty && store.errors.isEmpty {
-                    Text("No threads in the last 7 days").foregroundStyle(.gray).padding()
+                    Text("All quiet.").font(design.small).foregroundStyle(design.detail).padding(16)
                 }
                 ForEach(Array(store.rows.enumerated()), id: \.element.id) { i, row in
                     if i == 0 || store.rows[i - 1].section != row.section {
-                        Text(row.section.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.8)
-                            .foregroundStyle(row.section == "Priority" ? Color.orange.opacity(0.85) : .white.opacity(0.35))
+                        Text(row.section).font(design.header)
+                            .foregroundStyle(row.section == "Priority" ? design.text : design.detail)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 10).padding(.top, i == 0 ? 4 : 14).padding(.bottom, 3)
+                            .padding(.horizontal, 12).padding(.top, i == 0 ? 4 : 16).padding(.bottom, 4)
                     }
-                    RowView(row: row).onTapGesture { onPick(row) }
+                    RowView(row: row, design: design).onTapGesture { onPick(row) }
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.bottom, 10)
+            .padding(.horizontal, 8)
+            .padding(.bottom, 8)
         }
     }
 }
 
 struct RowView: View {
     let row: Row
+    let design: Design
     @State private var hover = false
 
     var inTerminal: Bool { row.src.hasSuffix("-cli") || row.src == "claude-bg" }
@@ -168,35 +223,49 @@ struct RowView: View {
         }
     }
 
-    var body: some View {
-        HStack(spacing: 11) {
-            ZStack(alignment: .bottomTrailing) {
-                appIcon(row, size: 28)
-                if stateLabel != nil {
-                    Circle().fill(stateColor(row.state)).frame(width: 9, height: 9)
-                        .overlay(Circle().stroke(.black, lineWidth: 2)).offset(x: 2, y: 2)
-                }
+    // The terminal marker sits on the icon, not in the text line, so every row's text lines up in columns
+    var icon: some View {
+        appIcon(row, size: 24).overlay(alignment: .bottomTrailing) {
+            if inTerminal {
+                Image(systemName: "terminal.fill").font(.system(size: 7, weight: .bold)).foregroundStyle(design.text)
+                    .padding(2).background(Circle().fill(.black)).offset(x: 4, y: 4)
             }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(row.title).font(.system(size: 13, weight: .medium)).foregroundStyle(.white).lineLimit(1)
-                HStack(spacing: 5) {
-                    Text(row.age).monospacedDigit().foregroundStyle(.white.opacity(0.55))
-                    if inTerminal {
-                        Image(systemName: "terminal").font(.system(size: 9)).foregroundStyle(.white.opacity(0.4))
+        }
+    }
+
+    var body: some View {
+        let tint = design.color(row.state)
+        HStack(spacing: 12) {
+            switch design.marker {
+            case .lamp:  // indicator lamp: lit in the state color, a dim ring when idle
+                Circle().fill(tint ?? .clear).frame(width: 8, height: 8)
+                    .overlay(Circle().stroke(tint ?? design.detail.opacity(0.4), lineWidth: 1))
+                icon
+            case .margin:
+                Text(row.age).font(design.age).foregroundStyle(design.detail).frame(width: 32, alignment: .leading)
+                icon
+            case .halo:
+                icon.padding(4)
+                    .overlay(Circle().stroke(tint ?? .clear, lineWidth: 2))
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(row.title).font(design.title).foregroundStyle(design.text).lineLimit(1)
+                HStack(spacing: 8) {
+                    if design.marker != .margin {  // fixed column: "now", "53m" and "1d" all take the same width
+                        Text(row.age).font(design.age).foregroundStyle(design.detail).frame(width: 28, alignment: .leading)
                     }
-                    if let stateLabel {
-                        Text(stateLabel).fontWeight(.medium).foregroundStyle(stateColor(row.state))
+                    if let stateLabel, let tint {
+                        Text(stateLabel).font(design.small.weight(.medium)).foregroundStyle(tint)
                     }
                     if let detail = row.detail, !detail.isEmpty {
-                        Text(detail).foregroundStyle(.white.opacity(0.4)).lineLimit(1)
+                        Text(detail).font(design.small).foregroundStyle(design.detail.opacity(0.8)).lineLimit(1)
                     }
                 }
-                .font(.system(size: 11))
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 10).padding(.vertical, 7)
-        .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(hover ? 0.08 : 0)))
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 10).fill(design.text.opacity(hover ? 0.08 : 0)))
         .contentShape(Rectangle())
         .onHover { hover = $0 }
     }
@@ -221,13 +290,17 @@ final class HoverHostingView<V: View>: NSHostingView<V> {
 
 final class Island: NSObject {
     let store = Store()
+    let state = IslandState()
     let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     var host: HoverHostingView<IslandView>!
     var expanded = false
     var notch = CGSize(width: 180, height: 32)
     var hoverWork: DispatchWorkItem?
     var ticks = 0
+    var collapsed = CGSize.zero
     let wing: CGFloat = 44, expandedSize = CGSize(width: 520, height: 480)
+    let pad: CGFloat = 16  // window margin so the spring's overshoot isn't clipped
+    let spring = Animation.spring(response: 0.38, dampingFraction: 0.72)
 
     func start() {
         panel.isOpaque = false
@@ -253,7 +326,7 @@ final class Island: NSObject {
     }
 
     func view() -> IslandView {
-        IslandView(store: store, expanded: expanded, notch: notch) { [weak self] row in
+        IslandView(store: store, state: state, notch: notch, collapsed: collapsed, full: expandedSize) { [weak self] row in
             self?.store.jump(row)
             self?.setExpanded(false)
         }
@@ -270,8 +343,15 @@ final class Island: NSObject {
     func setExpanded(_ value: Bool) {
         guard value != expanded else { return }
         expanded = value
-        if value { store.refresh() }
-        layout()
+        // The window jumps to full size and SwiftUI springs the shape inside it;
+        // on collapse the window shrinks only after the spring settles.
+        if value { store.refresh(); layout() }
+        withAnimation(spring) { state.expanded = value }
+        if !value {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                if self?.expanded == false { self?.layout() }
+            }
+        }
     }
 
     func layout() {
@@ -281,16 +361,12 @@ final class Island: NSObject {
         } else {
             notch = CGSize(width: 180, height: NSStatusBar.system.thickness)
         }
-        let size = expanded ? expandedSize
-            : CGSize(width: notch.width + 2 * wing, height: notch.height)
+        collapsed = CGSize(width: notch.width + 2 * wing, height: notch.height)
+        let size = expanded ? CGSize(width: expandedSize.width + 2 * pad, height: expandedSize.height + pad) : collapsed
         let f = screen.frame
         let frame = NSRect(x: f.midX - size.width / 2, y: f.maxY - size.height, width: size.width, height: size.height)
         host.rootView = view()
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.22
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            panel.animator().setFrame(frame, display: true)
-        }
+        panel.setFrame(frame, display: true)
     }
 }
 

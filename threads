@@ -145,7 +145,8 @@ def claude_desktop_rows():
             d = json.load(open(f))
         except (OSError, ValueError):
             continue
-        ts = (d.get('lastActivityAt') or 0) / 1000
+        # your last message, like Codex's recency_at; lastActivityAt moves with every agent step
+        ts = (d.get('latestUserFrameAt') or d.get('lastActivityAt') or 0) / 1000
         if d.get('isArchived') or ts < CUTOFF:
             continue
         summary = d.get('postTurnSummary') or {}
@@ -156,27 +157,39 @@ def claude_desktop_rows():
     return rows
 
 
-def transcript_title(session_id):
-    """Latest user rename, else latest AI title, from the end of a Claude transcript."""
+def transcript_info(session_id):
+    """(title, time of your last message) from the end of a Claude transcript. The title is the latest
+    rename, else the latest AI title. Rows sort on your last message, like Codex's recency_at, so agent
+    activity doesn't reshuffle the list."""
     paths = glob.glob(f'{HOME}/.claude/projects/*/{session_id}.jsonl')
     if not paths:
-        return None
-    with open(paths[0], 'rb') as fh:
-        fh.seek(max(0, os.path.getsize(paths[0]) - 512 * 1024))  # titles are re-written often; the tail has the latest
-        tail = fh.read().decode('utf-8', 'ignore')
-    custom = ai = None
-    for text in tail.splitlines():
-        if '-title"' not in text:
-            continue
-        try:
-            rec = json.loads(text)
-        except ValueError:
-            continue
-        if rec.get('type') == 'custom-title':
-            custom = rec.get('customTitle')
-        elif rec.get('type') == 'ai-title':
-            ai = rec.get('aiTitle')
-    return custom or ai
+        return None, None
+    size = os.path.getsize(paths[0])
+    custom = ai = sent = None
+    # ponytail: tail reads (transcripts reach 100+ MB); an agent that wrote more than 8 MB since your
+    # last message falls back to activity time
+    for span in (512 * 1024, 8 * 1024 * 1024):
+        with open(paths[0], 'rb') as fh:
+            fh.seek(max(0, size - span))
+            tail = fh.read().decode('utf-8', 'ignore')
+        for text in tail.splitlines():
+            if '-title"' not in text and '"kind":"human"' not in text:
+                continue
+            try:
+                rec = json.loads(text)
+            except ValueError:
+                continue
+            if rec.get('type') == 'custom-title':
+                custom = rec.get('customTitle')
+            elif rec.get('type') == 'ai-title':
+                ai = rec.get('aiTitle')
+            elif rec.get('type') == 'user' and (rec.get('origin') or {}).get('kind') == 'human':
+                sent = rec.get('timestamp')
+        if sent or span >= size:
+            break
+    if sent:
+        sent = datetime.datetime.fromisoformat(sent.replace('Z', '+00:00')).timestamp()
+    return custom or ai, sent
 
 
 def claude_cli_rows(procs, gtty):
@@ -210,9 +223,9 @@ def claude_cli_rows(procs, gtty):
             continue
         if jid in parked and not d.get('name'):
             continue
-        ts = os.path.getmtime(f)
-        if ts < CUTOFF:
+        if os.path.getmtime(f) < CUTOFF:
             continue
+        ts = transcript_info(d.get('sessionId'))[1] or os.path.getmtime(f)
         seen.add(d.get('sessionId'))
         # state.json lags a reply (stays 'blocked' until the next summary); a busy live session wins, as in `claude agents`
         state = 'working' if jid in busy_jobs else {'blocked': 'needs you'}.get(d.get('state'), d.get('state') or '')
@@ -228,11 +241,12 @@ def claude_cli_rows(procs, gtty):
         # agent-view windows aren't threads; the jobs they show are listed above
         if d.get('sessionId') in seen or d.get('parkedJobId'):
             continue
-        ts = (d.get('updatedAt') or d.get('startedAt') or 0) / 1000
+        t_title, sent = transcript_info(d['sessionId'])
+        ts = sent or (d.get('updatedAt') or d.get('startedAt') or 0) / 1000
         state = 'working' if d.get('status') == 'busy' else ''
         tty = tty_of.get(d['pid'])
         title = d.get('name') if d.get('nameSource') == 'user' else None
-        title = title or transcript_title(d['sessionId']) or d.get('name') or d['sessionId']
+        title = title or t_title or d.get('name') or d['sessionId']
         if tty in gtty:
             rows.append(row(d['sessionId'], ts, 'claude-cli', state, title, d.get('cwd', ''), 'focus', tty))
         else:  # outside Ghostty (e.g. Warp) there is no way to pick the tab
@@ -275,7 +289,8 @@ def sectioned(rows):
     """Priority (by rank, then newest), then Today / Yesterday / weekday sections (newest first)."""
     priority = sorted((r for r in rows if r['state'] in PRIORITY_RANK),
                       key=lambda r: (PRIORITY_RANK[r['state']], -r['ts']))
-    recent = sorted((r for r in rows if r['state'] not in PRIORITY_RANK), key=lambda r: -r['ts'])
+    # the 7-day window applies to sort time (your last message), which can be older than a source's file mtime
+    recent = sorted((r for r in rows if r['state'] not in PRIORITY_RANK and r['ts'] >= CUTOFF), key=lambda r: -r['ts'])
     for r in priority:
         r['section'] = 'Priority'
     for r in recent:

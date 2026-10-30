@@ -9,11 +9,15 @@ Codex's own activity view orders them.
 
 ## What you see
 
-- **Collapsed:** a black pill around the notch. The left side counts threads that need you (orange),
-  the right side counts threads that are working (green).
+- **Collapsed:** a black pill around the notch. The left side counts threads that need you,
+  the right side counts threads that are working.
 - **Expanded (hover):** a **Priority** section first (needs you, then working), then **Today**,
-  **Yesterday** and one section per weekday for the last 7 days. Each row starts with the app icon,
-  so you can scan for "the Codex one" by color, and the age is right under the title.
+  **Yesterday** and one section per weekday for the last 7 days. Like Codex, threads sort by when you
+  last sent a message, so agent activity never reshuffles the list and positions stay where you learned
+  them. Each row starts with the app icon, so you can scan for "the Codex one", and shows its age.
+- **Design:** right-click the island to pick one of three designs: Instrument (state lamps in one
+  column), Ink (serif titles, age in the margin) or Tide (rounded type, state ring around the icon).
+  Nothing moves unless you hover.
 - **Health:** each source reads files that an app update can change. If a source breaks, a red line in
   the panel (and a triangle on the pill) says which one, so the list never silently shrinks.
 
