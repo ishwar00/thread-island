@@ -16,6 +16,10 @@ struct Payload: Decodable {
     let errors: [String]
 }
 
+struct JumpResult: Decodable {
+    let error: String?
+}
+
 func runThreads(_ args: [String], input: Data? = nil) -> Data {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -35,7 +39,10 @@ func runThreads(_ args: [String], input: Data? = nil) -> Data {
 
 final class Store: ObservableObject {
     @Published var rows: [Row] = []
-    @Published var errors: [String] = []
+    @Published var sourceErrors: [String] = []
+    // kept until a jump succeeds, so a refresh doesn't hide why the last click did nothing
+    @Published var jumpError: String?
+    var errors: [String] { sourceErrors + (jumpError.map { ["Jump: \($0)"] } ?? []) }
     private var loading = false
 
     func refresh() {
@@ -47,18 +54,24 @@ final class Store: ObservableObject {
             DispatchQueue.main.async {
                 self.loading = false
                 guard let payload else {
-                    self.errors = ["threads script: no readable output (\(data.count) bytes)"]
+                    self.sourceErrors = ["threads script: no readable output (\(data.count) bytes)"]
                     return
                 }
                 self.rows = payload.rows
-                self.errors = payload.errors
+                self.sourceErrors = payload.errors
             }
         }
     }
 
     func jump(_ row: Row) {
         guard let payload = try? JSONEncoder().encode(row) else { return }
-        DispatchQueue.global(qos: .userInitiated).async { _ = runThreads(["--jump"], input: payload) }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = runThreads(["--jump"], input: payload)
+            let result = try? JSONDecoder().decode(JumpResult.self, from: data)
+            DispatchQueue.main.async {
+                self.jumpError = result == nil ? "threads script: no readable output (\(data.count) bytes)" : result?.error
+            }
+        }
     }
 
     var needsYou: Int { rows.filter { $0.state == "needs you" }.count }

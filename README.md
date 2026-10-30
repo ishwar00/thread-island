@@ -13,9 +13,9 @@ Codex's own activity view orders them.
   the right side counts threads that are working.
 - **Expanded (hover):** a **Priority** section first, then **Today**, **Yesterday** and one section per
   weekday for the last 7 days. Rows never swap places, so positions stay where you learned them:
-  - **Priority** holds threads that are working, need you, or were active in the last 2 hours, in the
-    order they became active. A thread that becomes active, new or old, joins at the bottom; a thread
-    idle for 2 hours drops into its day.
+  - **Priority** holds threads with any activity (yours or the agent's) in the last 2 hours, in the
+    order their current run of activity began. A thread that becomes active, new or old, joins at the
+    bottom; after 2 hours with no activity, whatever its state, it drops into its day.
   - **Day sections** sort by when you last sent a message.
 
   Each row starts with the app icon, so you can scan for "the Codex one", and shows its age.
@@ -23,7 +23,9 @@ Codex's own activity view orders them.
   column), Ink (serif titles, age in the margin) or Tide (rounded type, state ring around the icon).
   Nothing moves unless you hover.
 - **Health:** each source reads files that an app update can change. If a source breaks, a red line in
-  the panel (and a triangle on the pill) says which one, so the list never silently shrinks.
+  the panel (and a triangle on the pill) says which one, so the list never silently shrinks. One
+  unreadable thread is reported and skipped; the rest of its source still shows. A click that fails to
+  open its thread says why in the same place.
 
 ## Where threads come from, and where a click takes you
 
@@ -40,7 +42,8 @@ found by the `WARP_FOCUS_URL` (`warp://session/<id>`) Warp puts in every session
 from sessions that Warp itself started.
 
 A new session opens in the terminal you were just using: a Ghostty window, or a Warp tab (through a
-Warp Tab Config, `~/.warp/tab_configs/threadisland.toml`, since Warp's URLs can't run a command). If you
+Warp Tab Config, `~/.warp/tab_configs/threadisland-<id>.toml`, since Warp's URLs can't run a command;
+configs older than a day are deleted). If you
 were in neither, it uses whichever is running, Ghostty first.
 
 ## Install
@@ -69,6 +72,7 @@ Run `threads` yourself to see the raw data.
 
 - Codex and Claude Code don't publish these file formats. An update can break a source; the health line
   tells you when.
-- Codex records when a turn starts and ends, but not when it waits for your approval, so Codex threads
-  show as working, never as "needs you". A turn with no writes for 10 minutes stops counting as working.
+- A Codex thread shows "needs you" when it asked you a question (its `request_user_input` tool) that you
+  haven't answered yet, with the question as its detail line. Codex doesn't record when it waits for a
+  command approval, so that wait shows as working; a turn with no writes for 10 minutes stops counting.
 - Live sessions in terminals other than Ghostty and Warp show in the list but can't be jumped to.

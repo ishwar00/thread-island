@@ -23,13 +23,15 @@ NOW = time.time()
 TODAY = datetime.date.today()
 # Same window as Codex's activity view: today plus the previous 6 local days
 CUTOFF = time.mktime((TODAY - datetime.timedelta(days=WINDOW_DAYS - 1)).timetuple())
-ACTIVE = {'needs you', 'failed', 'working'}
-# A thread stays in Priority until the agent has been idle this long
+# A thread is in Priority while it has had activity in the last 2 h; 2 h without any activity ends its run
 IDLE_OUT = 2 * 3600
+# one bad record (a transcript that vanished, a file mid-write) is reported here and skipped, not the whole source
+ERRORS = []
 
-def run(cmd, stdin=None):
+
+def run(cmd, stdin=None, timeout=10):
     try:
-        return subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=10).stdout
+        return subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout).stdout
     except (OSError, subprocess.TimeoutExpired):
         return ''
 
@@ -49,18 +51,21 @@ def ghostty_ttys():
     return {t.strip() for t in out.split(',') if t.strip()}
 
 
+WARP_EXE = re.compile(r'^\S*/Warp\.app/Contents/MacOS/')
+
+
 def focus_target(p, gtty, by_pid):
     """(action, arg) that focuses the terminal a live session runs in: its Ghostty terminal by TTY, else its
     Warp tab via the WARP_FOCUS_URL Warp exports to every session (warpdotdev/warp PR #11130), else None."""
     if p['tty'] in gtty:
         return 'focus', p['tty']
     # The URL is inherited by everything a Warp tab starts, including Claude's background-job daemon and its
-    # workers (which get their own TTYs), so trust it only when Warp itself is an ancestor of the session.
-    a, hops = p, 0
-    while a and 'Warp.app/' not in a['args'] and hops < 30:
+    # workers (which get their own TTYs), so trust it only when a Warp executable is an ancestor of the session.
+    a, hops = by_pid.get(p['ppid']), 0
+    while a and not WARP_EXE.match(a['args']) and hops < 30:
         a, hops = by_pid.get(a['ppid']), hops + 1
-    if a and 'Warp.app/' in a['args']:
-        for tok in run(['ps', 'eww', '-o', 'command=', '-p', str(p['pid'])]).split():
+    if a:
+        for tok in run(['ps', 'eww', '-o', 'command=', '-p', str(p['pid'])], timeout=3).split():
             if tok.startswith('WARP_FOCUS_URL=warp://session/'):
                 return 'url', tok.split('=', 1)[1]
     return None
@@ -76,8 +81,8 @@ def processes():
 
 
 def row(key, ts, src, state, title, detail, action, arg, cwd=''):
-    # key is stable across refreshes (thread/job/session id); ts is your last message (the sort time);
-    # each source then sets 'active' (the agent's last activity) and 'created' (Priority's sort time)
+    # key is stable across refreshes (thread/job/session id); ts is your last message (day sections sort on
+    # it); each source then sets 'active' (last activity), 'entered' (start of the current run) and 'created'
     return {'key': key, 'ts': ts, 'src': src, 'state': state, 'title': title, 'detail': detail,
             'action': action, 'arg': arg, 'cwd': cwd}
 
@@ -87,32 +92,119 @@ def plain(md):
     return re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', md).replace('**', '').replace('`', '')
 
 
-def codex_turn(rollout):
-    """(state, last reply) from the end of a Codex rollout: a turn that started and is still being
-    written is working; its last task_complete carries the reply shown in Codex's sidebar."""
+def lines_back(path, chunk=256 * 1024):
+    """Lines of a file, newest first, read from the end in chunks that double up to 4 MB: most answers are
+    in the last few hundred KB. Memory is a chunk plus the longest line."""
+    with open(path, 'rb') as fh:
+        pos, carry = os.path.getsize(path), b''
+        while pos > 0:
+            n = min(chunk, pos)
+            chunk = min(chunk * 2, 4 * 1024 * 1024)
+            pos -= n
+            fh.seek(pos)
+            lines = (fh.read(n) + carry).split(b'\n')
+            carry = lines.pop(0) if pos > 0 else b''  # may continue in the previous chunk
+            for line in reversed(lines):
+                if line:
+                    yield line
+
+
+def line_time(line, last):
+    """A log line's timestamp without decoding the line: Codex puts it first, Claude after the message."""
+    i = line.rfind(b'"timestamp":"') if last else line.find(b'"timestamp":"')
+    if i < 0:
+        return None
     try:
-        size = os.path.getsize(rollout)
-        with open(rollout, 'rb') as fh:
-            fh.seek(max(0, size - 512 * 1024))
-            tail = fh.read().decode('utf-8', 'ignore').splitlines()
-    except OSError:
-        return '', None
-    for text in reversed(tail):
-        if '"task_' not in text and '"turn_aborted"' not in text:
-            continue
-        try:
-            payload = json.loads(text).get('payload') or {}
-        except ValueError:
-            continue
-        kind = payload.get('type')
-        if kind == 'task_started':
-            # Codex writes nothing while a turn waits on approval or hangs, so only a fresh write counts as working
-            return ('working' if NOW - os.path.getmtime(rollout) < 600 else ''), None
-        if kind == 'task_complete':
-            return '', plain((payload.get('last_agent_message') or '').strip().split('\n')[0]) or None
-        if kind == 'turn_aborted':
-            return '', None
+        return epoch(line[i + 13:line.find(b'"', i + 13)].decode())
+    except ValueError:
+        return None
+
+
+def loads(line):
+    try:
+        return json.loads(line)
+    except ValueError:
+        return {}
+
+
+def scan_log(kind, path, sent=False, title=False):
+    """Read a Codex rollout or Claude transcript backwards, only as far as needed, for:
+    active  - its newest entry;
+    entered - the start of its current run of activity (the oldest entry with no IDLE_OUT gap after it),
+              only while the thread is in Priority; the same rule that puts it there, so a long turn or a
+              long wait on you can't reorder Priority without the thread leaving it;
+    turn    - Codex: its latest turn event; sent, title - Claude, when asked: your last message, its name;
+    asked   - Codex: the question it asked you (request_user_input) if you haven't answered since."""
+    out = {}
+    claude = kind == 'claude'
+    need_run, need_sent, need_title, need_turn, need_ask = True, sent, title, not claude, not claude
+    run_start = ai = None
+    scanned = 0
+    for line in lines_back(path):
+        scanned += len(line) + 1
+        t = line_time(line, claude)
+        if t is not None and need_run:
+            if 'active' not in out:
+                out['active'] = t
+                need_run = NOW - t < IDLE_OUT
+            elif run_start - t >= IDLE_OUT:
+                out['entered'], need_run = run_start, False
+            run_start = t if need_run else run_start
+        if need_sent and b'"kind":"human"' in line:
+            rec = loads(line)
+            if rec.get('type') == 'user' and (rec.get('origin') or {}).get('kind') == 'human':
+                out['sent'], need_sent = epoch(rec['timestamp']), False
+        if need_title:
+            if b'"type":"custom-title"' in line:
+                out['title'], need_title = loads(line).get('customTitle'), False
+            elif ai is None and b'"type":"ai-title"' in line:
+                ai = loads(line).get('aiTitle')
+            if scanned > 8 * 1024 * 1024:  # renames are re-logged often; an older one isn't the latest
+                need_title = False
+        if need_turn and (b'"task_' in line or b'"turn_aborted"' in line):
+            payload = loads(line).get('payload') or {}
+            if payload.get('type') in ('task_started', 'task_complete', 'turn_aborted'):
+                out['turn'], need_turn = payload, False
+        if need_ask and b'"type":"UserMessage"' in line:  # your message or answer; anything older is answered
+            need_ask = False
+        elif need_ask and b'"name":"request_user_input' in line:  # also listed in tool definitions
+            payload = loads(line).get('payload') or {}
+            if payload.get('type') == 'function_call':
+                try:
+                    questions = json.loads(payload.get('arguments') or '{}').get('questions') or [{}]
+                except ValueError:
+                    questions = [{}]
+                out['asked'], need_ask = plain(questions[0].get('title') or questions[0].get('question') or '') or 'Asked you a question', False
+        if not (need_run or need_sent or need_title or need_turn or need_ask):
+            break
+    if need_run and run_start is not None:  # the run reaches back to the first entry
+        out['entered'] = run_start
+    if not out.get('title'):
+        out['title'] = ai
+    return out
+
+
+def codex_turn(turn, rollout, asked=None):
+    """(state, last reply) from a Codex rollout's latest turn event: a started turn that is still being
+    written is working; task_complete carries the reply shown in Codex's sidebar. An unanswered question
+    wins: the agent keeps polling while it waits for your answer, which would otherwise read as working."""
+    if asked:
+        return 'needs you', asked
+    kind = (turn or {}).get('type')
+    if kind == 'task_started':
+        # Codex writes nothing while a turn waits on approval or hangs, so only a fresh write counts as working
+        return ('working' if NOW - os.path.getmtime(rollout) < 600 else ''), None
+    if kind == 'task_complete':
+        return '', plain((turn.get('last_agent_message') or '').strip().split('\n')[0]) or None
     return '', None
+
+
+def logged(r, log, fallback_active):
+    """Fill a row's activity fields from its log, falling back to the source's own timestamps."""
+    r['active'] = log.get('active') or fallback_active
+    if log.get('entered'):
+        r['entered'] = log['entered']
+    return r
 
 
 def codex_rows(procs, gtty):
@@ -120,15 +212,21 @@ def codex_rows(procs, gtty):
                  key=lambda p: int(re.search(r'state_(\d+)', p).group(1)))
     if not dbs:
         return []
-    query = """select id, coalesce(name, title), cwd, source, recency_at_ms, updated_at_ms, created_at_ms, rollout_path from threads
+    # unread: Codex's blue dot, a finished turn you haven't opened yet; cleared when you open the thread
+    query = """select id, coalesce(name, title), cwd, source, recency_at_ms, updated_at_ms, created_at_ms, rollout_path,
+                      {unread}
+               from threads
                where archived = 0 and coalesce(thread_source, 'user') = 'user'
                  and source in ('vscode', 'cli') and recency_at_ms >= ?"""
+    receipts = """exists(select 1 from thread_read_receipts r where r.thread_id = threads.id
+                                and r.first_unread_turn is not null)"""
     # not mode=ro: a read-only open fails whenever Codex has just checkpointed the WAL to 0 bytes.
     # A normal connection joins WAL locking like any reader; query_only forbids writes from here.
     con = sqlite3.connect(dbs[-1], timeout=2)
     try:
         con.execute('pragma query_only = 1')
-        found = con.execute(query, (CUTOFF * 1000,)).fetchall()
+        has_receipts = con.execute("select 1 from sqlite_master where name = 'thread_read_receipts'").fetchone()
+        found = con.execute(query.format(unread=receipts if has_receipts else '0'), (CUTOFF * 1000,)).fetchall()
     finally:
         con.close()
 
@@ -137,65 +235,62 @@ def codex_rows(procs, gtty):
     for p in procs:
         if p['tty'] != '/dev/??' and re.search(r'(^|/)codex(\s|$)', p['args']):
             target = None
-            for name in run(['lsof', '-p', str(p['pid']), '-Fn']).splitlines():
+            for name in run(['lsof', '-p', str(p['pid']), '-Fn'], timeout=3).splitlines():
                 if name.startswith('n') and 'rollout-' in name:
                     live[name[1:]] = target = target or focus_target(p, gtty, by_pid)
 
     rows = []
-    for tid, title, cwd, source, rec_ms, upd_ms, created_ms, rollout in found:
-        src = 'codex' if source == 'vscode' else 'codex-cli'
-        state, reply = codex_turn(rollout)
-        detail = reply or os.path.basename(cwd)
-        if live.get(rollout):
-            rows.append(row(tid, rec_ms / 1000, src, state, title, detail, *live[rollout]))
-        elif source == 'vscode':
-            rows.append(row(tid, rec_ms / 1000, src, state, title, detail, 'url', f'codex://threads/{tid}'))
-        else:
-            rows.append(row(tid, rec_ms / 1000, src, state, title, detail, 'tab', f'codex resume {tid}', cwd))
-        rows[-1].update(active=(upd_ms or rec_ms) / 1000, created=(created_ms or rec_ms) / 1000, log=('codex', rollout))
+    for tid, title, cwd, source, rec_ms, upd_ms, created_ms, rollout, unread in found:
+        try:
+            log = scan_log('codex', rollout) if rollout and os.path.exists(rollout) else {}
+            src = 'codex' if source == 'vscode' else 'codex-cli'
+            state, reply = codex_turn(log.get('turn'), rollout, log.get('asked')) if log else ('', None)
+            if unread and not state:  # finished and not yet read: your turn, like a finished Claude thread
+                state = 'needs you'
+            detail = reply or os.path.basename(cwd)
+            if live.get(rollout):
+                r = row(tid, rec_ms / 1000, src, state, title, detail, *live[rollout])
+            elif source == 'vscode':
+                r = row(tid, rec_ms / 1000, src, state, title, detail, 'url', f'codex://threads/{tid}')
+            else:
+                r = row(tid, rec_ms / 1000, src, state, title, detail, 'tab', f'codex resume {tid}', cwd)
+            r['created'] = (created_ms or rec_ms) / 1000
+            rows.append(logged(r, log, (upd_ms or rec_ms) / 1000))
+        except Exception as e:  # noqa: BLE001
+            ERRORS.append(f'Codex thread {tid}: {type(e).__name__}: {e}')
     return rows
 
 
-def claude_desktop_rows():
+def claude_desktop_rows(sessions):
+    busy = {d.get('sessionId') for d in sessions if d.get('status') == 'busy'}
     rows = []
     pattern = f'{HOME}/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json'
     for f in glob.glob(pattern):
-        if os.path.getmtime(f) < CUTOFF:  # files are large; mtime >= lastActivityAt, so skip unparsed
-            continue
         try:
-            d = json.load(open(f))
-        except (OSError, ValueError):
-            continue
-        # your last message, like Codex's recency_at; lastActivityAt moves with every agent step
-        ts = (d.get('latestUserFrameAt') or d.get('lastActivityAt') or 0) / 1000
-        if d.get('isArchived') or ts < CUTOFF:
-            continue
-        summary = d.get('postTurnSummary') or {}
-        state = 'needs you' if summary.get('status_category') == 'blocked' else ''
-        rows.append(row(d['sessionId'], ts, 'claude-app', state, d.get('title') or '(untitled)',
-                        summary.get('status_detail') or d.get('cwd', ''),
-                        'url', f"claude://code/continue?session={d['sessionId']}"))
-        rows[-1].update(active=(d.get('lastActivityAt') or 0) / 1000, created=(d.get('createdAt') or 0) / 1000,
-                        log=('claude', transcript_path(d.get('cliSessionId'))))
+            if os.path.getmtime(f) < CUTOFF:  # files are large; mtime >= lastActivityAt, so skip unparsed
+                continue
+            try:
+                d = json.load(open(f))
+            except ValueError:  # being rewritten right now; next refresh reads it
+                continue
+            # your last message, like Codex's recency_at; lastActivityAt moves with every agent step
+            ts = (d.get('latestUserFrameAt') or d.get('lastActivityAt') or 0) / 1000
+            if d.get('isArchived') or ts < CUTOFF:
+                continue
+            summary = d.get('postTurnSummary') or {}
+            # a turn in progress wins over the previous turn's summary
+            state = ('working' if d.get('cliSessionId') in busy
+                     else 'needs you' if summary.get('status_category') == 'blocked' else '')
+            path = transcript_path(d.get('cliSessionId'))
+            log = scan_log('claude', path) if path else {}
+            r = row(d['sessionId'], ts, 'claude-app', state, d.get('title') or '(untitled)',
+                    summary.get('status_detail') or d.get('cwd', ''),
+                    'url', f"claude://code/continue?session={d['sessionId']}")
+            r['created'] = (d.get('createdAt') or 0) / 1000
+            rows.append(logged(r, log, (d.get('lastActivityAt') or 0) / 1000))
+        except Exception as e:  # noqa: BLE001
+            ERRORS.append(f'Claude app {os.path.basename(f)}: {type(e).__name__}: {e}')
     return rows
-
-
-def records(buf, marker):
-    """JSON lines in buf that contain marker, newest first. Searches the raw bytes backwards, so only
-    matching lines are decoded (decoding and splitting whole tails peaked at 150 MB)."""
-    end = len(buf)
-    while (i := buf.rfind(marker, 0, end)) != -1:
-        start = buf.rfind(b'\n', 0, i) + 1
-        stop = buf.find(b'\n', i)
-        try:
-            yield json.loads(buf[start:stop if stop != -1 else len(buf)])
-        except ValueError:  # the tail's first line may be cut off
-            pass
-        end = start
-
-
-def last_record(buf, marker, rtype):
-    return next((r for r in records(buf, marker) if r.get('type') == rtype), None)
 
 
 def transcript_path(session_id):
@@ -203,71 +298,24 @@ def transcript_path(session_id):
     return paths[0] if paths else None
 
 
-# Where each source records a turn: Claude marks the messages you type, Codex logs every turn start
-TURNS = {
-    'claude': (b'"origin":{"kind":"human"}', lambda r: r.get('type') == 'user'),
-    'codex': (b'"type":"task_started"', lambda r: (r.get('payload') or {}).get('type') == 'task_started'),
-}
-
-
-def streak_start(kind, path):
-    """When the thread's current run of activity began: its first turn after a gap of IDLE_OUT or more,
-    else its first turn. Reads the log backwards in 4 MB chunks only until that gap, so memory stays at
-    one chunk however long the log is."""
-    marker, is_turn = TURNS[kind]
-    chunk, start, carry = 4 * 1024 * 1024, None, b''
-    try:
-        with open(path, 'rb') as fh:
-            pos = os.path.getsize(path)
-            while pos > 0:
-                n = min(chunk, pos)
-                pos -= n
-                fh.seek(pos)
-                buf = fh.read(n) + carry
-                # the first line may continue in the previous chunk: keep it for the next round
-                cut = buf.find(b'\n') if pos > 0 else -1
-                carry, buf = (buf[:cut + 1], buf[cut + 1:]) if cut != -1 else (b'', buf)
-                for rec in records(buf, marker):
-                    if not is_turn(rec) or not rec.get('timestamp'):
-                        continue
-                    t = epoch(rec['timestamp'])
-                    if start is not None and start - t >= IDLE_OUT:
-                        return start
-                    start = t
-    except (OSError, ValueError):
-        pass
-    return start
-
-
-def transcript_info(session_id):
-    """(title, time of your last message) from the end of a Claude transcript. The title is the latest
-    rename, else the latest AI title. Rows sort on your last message, like Codex's recency_at, so agent
-    activity doesn't reshuffle the list."""
-    path = transcript_path(session_id)
-    if not path:
-        return None, None
-    size = os.path.getsize(path)
-    custom = ai = sent = None
-    # ponytail: tail reads (transcripts reach 100+ MB); an agent that wrote more than 8 MB since your
-    # last message falls back to activity time
-    for span in (512 * 1024, 8 * 1024 * 1024):
-        with open(path, 'rb') as fh:
-            fh.seek(max(0, size - span))
-            tail = fh.read()
-        custom = custom or last_record(tail, b'"type":"custom-title"', 'custom-title')
-        ai = ai or last_record(tail, b'"type":"ai-title"', 'ai-title')
-        human = last_record(tail, b'"origin":{"kind":"human"}', 'user')
-        sent = human.get('timestamp') if human else None
-        if sent or span >= size:
-            break
-    return (custom or {}).get('customTitle') or (ai or {}).get('aiTitle'), epoch(sent) if sent else None
-
-
 def epoch(iso):
     return datetime.datetime.fromisoformat(iso.replace('Z', '+00:00')).timestamp()
 
 
-def claude_cli_rows(procs, gtty):
+def live_sessions():
+    """Claude Code session records whose process is still running."""
+    out = []
+    for f in glob.glob(f'{HOME}/.claude/sessions/*.json'):
+        try:
+            d = json.load(open(f))
+            os.kill(d['pid'], 0)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        out.append(d)
+    return out
+
+
+def claude_cli_rows(procs, gtty, sessions):
     proc = {p['pid']: p for p in procs}
     attached = {}  # job name/id -> where its `claude attach` runs
     for p in procs:
@@ -278,12 +326,7 @@ def claude_cli_rows(procs, gtty):
                 attached[m.group(1)] = target
 
     live, busy_jobs = [], set()
-    for f in glob.glob(f'{HOME}/.claude/sessions/*.json'):
-        try:
-            d = json.load(open(f))
-            os.kill(d['pid'], 0)
-        except (OSError, ValueError, KeyError):
-            continue
+    for d in sessions:
         if d.get('kind') == 'interactive':
             live.append(d)
         elif d.get('jobId') and d.get('status') == 'busy':
@@ -295,42 +338,49 @@ def claude_cli_rows(procs, gtty):
     for f in glob.glob(f'{HOME}/.claude/jobs/*/state.json'):
         jid = os.path.basename(os.path.dirname(f))
         try:
-            d = json.load(open(f))
-        except (OSError, ValueError):
-            continue
-        if jid in parked and not d.get('name'):
-            continue
-        if os.path.getmtime(f) < CUTOFF:
-            continue
-        ts = transcript_info(d.get('sessionId'))[1] or os.path.getmtime(f)
-        seen.add(d.get('sessionId'))
-        # state.json lags a reply (stays 'blocked' until the next summary); a busy live session wins, as in `claude agents`
-        state = 'working' if jid in busy_jobs else {'blocked': 'needs you'}.get(d.get('state'), d.get('state') or '')
-        title = d.get('name') or d.get('displayIntent') or d.get('intent') or jid
-        target = next((attached[k] for k in (jid, d.get('name'), d.get('sessionId')) if k in attached), None)
-        if target:
-            rows.append(row(jid, ts, 'claude-bg', state, title, d.get('detail') or '', *target))
-        else:
-            rows.append(row(jid, ts, 'claude-bg', state, title, d.get('detail') or '', 'tab',
-                            f'claude attach {jid}', d.get('cwd') or HOME))
-        created = d.get('createdAt')
-        rows[-1].update(active=os.path.getmtime(f), created=epoch(created) if created else os.path.getmtime(f),
-                        log=('claude', transcript_path(d.get('sessionId'))))
+            try:
+                d = json.load(open(f))
+            except ValueError:  # being rewritten right now; next refresh reads it
+                continue
+            mtime = os.path.getmtime(f)
+            if (jid in parked and not d.get('name')) or mtime < CUTOFF:
+                continue
+            seen.add(d.get('sessionId'))
+            path = transcript_path(d.get('sessionId'))
+            log = scan_log('claude', path, sent=True) if path else {}
+            # state.json lags a reply (stays 'blocked' until the next summary); a busy live session wins, as in `claude agents`
+            state = 'working' if jid in busy_jobs else {'blocked': 'needs you'}.get(d.get('state'), d.get('state') or '')
+            title = d.get('name') or d.get('displayIntent') or d.get('intent') or jid
+            target = next((attached[k] for k in (jid, d.get('name'), d.get('sessionId')) if k in attached), None)
+            if target:
+                r = row(jid, log.get('sent') or mtime, 'claude-bg', state, title, d.get('detail') or '', *target)
+            else:
+                r = row(jid, log.get('sent') or mtime, 'claude-bg', state, title, d.get('detail') or '', 'tab',
+                        f'claude attach {jid}', d.get('cwd') or HOME)
+            r['created'] = epoch(d['createdAt']) if d.get('createdAt') else mtime
+            rows.append(logged(r, log, mtime))
+        except Exception as e:  # noqa: BLE001
+            ERRORS.append(f'Claude job {jid}: {type(e).__name__}: {e}')
 
     for d in live:
         # agent-view windows aren't threads; the jobs they show are listed above
         if d.get('sessionId') in seen or d.get('parkedJobId'):
             continue
-        t_title, sent = transcript_info(d['sessionId'])
-        ts = sent or (d.get('updatedAt') or d.get('startedAt') or 0) / 1000
-        state = 'working' if d.get('status') == 'busy' else ''
-        title = d.get('name') if d.get('nameSource') == 'user' else None
-        title = title or t_title or d.get('name') or d['sessionId']
-        target = focus_target(proc[d['pid']], gtty, proc) if d['pid'] in proc else None
-        # other terminals (Terminal.app, iTerm2, ...) aren't supported yet: the row shows but doesn't jump
-        rows.append(row(d['sessionId'], ts, 'claude-cli', state, title, d.get('cwd', ''), *(target or ('none', ''))))
-        rows[-1].update(active=(d.get('updatedAt') or d.get('startedAt') or 0) / 1000,
-                        created=(d.get('startedAt') or 0) / 1000, log=('claude', transcript_path(d['sessionId'])))
+        try:
+            path = transcript_path(d['sessionId'])
+            log = scan_log('claude', path, sent=True, title=True) if path else {}
+            updated = (d.get('updatedAt') or d.get('startedAt') or 0) / 1000
+            state = 'working' if d.get('status') == 'busy' else ''
+            title = d.get('name') if d.get('nameSource') == 'user' else None
+            title = title or log.get('title') or d.get('name') or d['sessionId']
+            target = focus_target(proc[d['pid']], gtty, proc) if d['pid'] in proc else None
+            # other terminals (Terminal.app, iTerm2, ...) aren't supported yet: the row shows but doesn't jump
+            r = row(d['sessionId'], log.get('sent') or updated, 'claude-cli', state, title, d.get('cwd', ''),
+                    *(target or ('none', '')))
+            r['created'] = (d.get('startedAt') or 0) / 1000
+            rows.append(logged(r, log, updated))
+        except Exception as e:  # noqa: BLE001
+            ERRORS.append(f'Claude session {d.get("sessionId")}: {type(e).__name__}: {e}')
     return rows
 
 
@@ -364,40 +414,56 @@ def new_session_terminal():
     return 'Warp' if run(['pgrep', '-f', '/Applications/Warp.app/Contents/MacOS/stable$']) else 'Ghostty'
 
 
-def warp_open(cwd, command):
+def toml_str(s):
+    """A TOML basic string; quotes, backslashes and control characters as \\uXXXX escapes."""
+    return '"' + ''.join(c if c not in '"\\' and 0x1f < ord(c) != 0x7f else f'\\u{ord(c):04x}' for c in s) + '"'
+
+
+def warp_open(cwd, command, key):
     """Open a Warp tab in cwd running command. The URI scheme can't run commands; a Tab Config can, and Warp
     re-reads the file on every open (https://docs.warp.dev/terminal/sessions/tab-configs). A new window
-    would also get an empty default tab, so this opens a tab in the front Warp window."""
-    with open(f'{HOME}/.warp/tab_configs/threadisland.toml', 'w') as fh:
-        fh.write('name = "ThreadIsland"\n\n[[panes]]\nid = "main"\ntype = "terminal"\n'
-                 f'directory = {json.dumps(cwd)}\ncommands = [{json.dumps(command)}]\n')
-    subprocess.run(['open', 'warp://tab_config/threadisland'])
+    would also get an empty default tab, so this opens a tab in the front Warp window. One config per
+    thread, written atomically, so two quick clicks can't open the same thread twice."""
+    folder = f'{HOME}/.warp/tab_configs'
+    os.makedirs(folder, exist_ok=True)
+    for old in glob.glob(f'{folder}/threadisland*.toml'):  # they show in Warp's + menu; keep a day's worth
+        if NOW - os.path.getmtime(old) > 86400:
+            os.remove(old)
+    name = 'threadisland-' + re.sub(r'[^A-Za-z0-9-]', '', key)[:40]
+    with open(f'{folder}/.{name}.tmp', 'w') as fh:
+        fh.write(f'name = "ThreadIsland"\n\n[[panes]]\nid = "main"\ntype = "terminal"\n'
+                 f'directory = {toml_str(cwd)}\ncommands = [{toml_str(command)}]\n')
+    os.replace(f'{folder}/.{name}.tmp', f'{folder}/{name}.toml')
+    return checked(['open', f'warp://tab_config/{name}'])
+
+
+def checked(cmd, stdin=None):
+    """Run a jump command; None on success, else what went wrong (shown in the panel)."""
+    p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=30)
+    return None if p.returncode == 0 else (p.stderr.strip() or f'{cmd[0]} exited with {p.returncode}')
 
 
 def jump(r):
     if r['action'] == 'url':
-        subprocess.run(['open', r['arg']])
-    elif r['action'] == 'focus':
-        subprocess.run(['osascript', '-', r['arg']], input=GHOSTTY_FOCUS, text=True)
-    elif r['action'] == 'tab':
+        return checked(['open', r['arg']])
+    if r['action'] == 'focus':
+        return checked(['osascript', '-', r['arg']], GHOSTTY_FOCUS)
+    if r['action'] == 'tab':
         if new_session_terminal() == 'Warp':
-            warp_open(r['cwd'] or HOME, r['arg'])
-        else:
-            subprocess.run(['osascript', '-', r['cwd'] or HOME, r['arg']], input=GHOSTTY_TAB, text=True)
+            return warp_open(r['cwd'] or HOME, r['arg'], r['key'])
+        return checked(['osascript', '-', r['cwd'] or HOME, r['arg']], GHOSTTY_TAB)
+    return None
 
 
 def sectioned(rows):
     """Positions are learned, so rows never swap, and nothing needs remembering between runs:
-    Priority holds threads that are active or were active in the last 2 h, in the order their current run
-    of activity began, so a thread that becomes active (new or not) joins at the bottom. Day sections sort
-    by your last message, which can't change there: a new message makes a thread active, and it moves to
-    Priority."""
+    Priority holds threads with activity in the last 2 h, in the order their current run of activity began,
+    so a thread that becomes active (new or not) joins at the bottom. A thread leaves after 2 h with no
+    activity, whatever its state, which is also what ends a run, so its slot can't change while it stays.
+    Day sections sort by your last message, which can't change there: a new message makes a thread active,
+    and it moves to Priority."""
     def hot(r):
-        return r['state'] in ACTIVE or NOW - r.get('active', 0) < IDLE_OUT
-    for r in rows:
-        kind, path = r.pop('log', (None, None))
-        if path and hot(r):
-            r['entered'] = streak_start(kind, path)
+        return NOW - r.get('active', 0) < IDLE_OUT
     priority = sorted((r for r in rows if hot(r)),
                       key=lambda r: r.get('entered') or r.get('created') or r['ts'])
     # the 7-day window applies to sort time (your last message), which can be older than a source's file mtime
@@ -413,24 +479,29 @@ def sectioned(rows):
 
 def main():
     if '--jump' in sys.argv:
-        jump(json.load(sys.stdin))
+        try:
+            error = jump(json.load(sys.stdin))
+        except Exception as e:  # noqa: BLE001 - shown in the panel
+            error = f'{type(e).__name__}: {e}'
+        json.dump({'error': error}, sys.stdout)
         return
 
     procs = processes()
     gtty = ghostty_ttys()
-    rows, errors = [], []
+    sessions = live_sessions()
+    rows = []
     # each source reads private files that an app update can change; report a broken one instead of hiding it
-    for name, source in (('Codex', lambda: codex_rows(procs, gtty)), ('Claude app', claude_desktop_rows),
-                         ('Claude CLI', lambda: claude_cli_rows(procs, gtty))):
+    for name, source in (('Codex', lambda: codex_rows(procs, gtty)), ('Claude app', lambda: claude_desktop_rows(sessions)),
+                         ('Claude CLI', lambda: claude_cli_rows(procs, gtty, sessions))):
         try:
             rows += source()
         except Exception as e:  # noqa: BLE001 - any failure here is shown in the panel
-            errors.append(f'{name}: {type(e).__name__}: {e}')
+            ERRORS.append(f'{name}: {type(e).__name__}: {e}')
     rows = sectioned(rows)
 
     for r in rows:
         r['age'] = ago(r['ts'])
-    json.dump({'rows': rows, 'errors': errors}, sys.stdout)
+    json.dump({'rows': rows, 'errors': ERRORS}, sys.stdout)
 
 
 if __name__ == '__main__':
