@@ -5,7 +5,7 @@ Sources: Codex desktop/CLI (~/.codex/state_*.sqlite), Claude desktop Code tab
 (claude-code-sessions/*.json), Claude CLI background jobs (~/.claude/jobs) and
 live interactive Claude CLI sessions (~/.claude/sessions).
 Jumps: codex:// and claude:// deep links, Ghostty AppleScript (focus tab by tty,
-or open a new tab running the resume command). `--jump` reads one row's JSON on stdin.
+or open a new window running the resume command). `--jump` reads one row's JSON on stdin.
 """
 import datetime
 import glob
@@ -47,6 +47,23 @@ def ghostty_ttys():
         return set()
     out = run(['osascript', '-e', 'tell application "Ghostty" to get tty of every terminal'])
     return {t.strip() for t in out.split(',') if t.strip()}
+
+
+def focus_target(p, gtty, by_pid):
+    """(action, arg) that focuses the terminal a live session runs in: its Ghostty terminal by TTY, else its
+    Warp tab via the WARP_FOCUS_URL Warp exports to every session (warpdotdev/warp PR #11130), else None."""
+    if p['tty'] in gtty:
+        return 'focus', p['tty']
+    # The URL is inherited by everything a Warp tab starts, including Claude's background-job daemon and its
+    # workers (which get their own TTYs), so trust it only when Warp itself is an ancestor of the session.
+    a, hops = p, 0
+    while a and 'Warp.app/' not in a['args'] and hops < 30:
+        a, hops = by_pid.get(a['ppid']), hops + 1
+    if a and 'Warp.app/' in a['args']:
+        for tok in run(['ps', 'eww', '-o', 'command=', '-p', str(p['pid'])]).split():
+            if tok.startswith('WARP_FOCUS_URL=warp://session/'):
+                return 'url', tok.split('=', 1)[1]
+    return None
 
 
 def processes():
@@ -115,21 +132,22 @@ def codex_rows(procs, gtty):
     finally:
         con.close()
 
-    # live Codex CLI in a Ghostty tab: match the rollout file it holds open
-    live = {}
+    # live Codex CLI in a terminal: match the rollout file it holds open
+    live, by_pid = {}, {p['pid']: p for p in procs}
     for p in procs:
-        if p['tty'] in gtty and re.search(r'(^|/)codex(\s|$)', p['args']):
+        if p['tty'] != '/dev/??' and re.search(r'(^|/)codex(\s|$)', p['args']):
+            target = None
             for name in run(['lsof', '-p', str(p['pid']), '-Fn']).splitlines():
                 if name.startswith('n') and 'rollout-' in name:
-                    live[name[1:]] = p['tty']
+                    live[name[1:]] = target = target or focus_target(p, gtty, by_pid)
 
     rows = []
     for tid, title, cwd, source, rec_ms, upd_ms, created_ms, rollout in found:
         src = 'codex' if source == 'vscode' else 'codex-cli'
         state, reply = codex_turn(rollout)
         detail = reply or os.path.basename(cwd)
-        if rollout in live:
-            rows.append(row(tid, rec_ms / 1000, src, state, title, detail, 'focus', live[rollout]))
+        if live.get(rollout):
+            rows.append(row(tid, rec_ms / 1000, src, state, title, detail, *live[rollout]))
         elif source == 'vscode':
             rows.append(row(tid, rec_ms / 1000, src, state, title, detail, 'url', f'codex://threads/{tid}'))
         else:
@@ -161,6 +179,23 @@ def claude_desktop_rows():
     return rows
 
 
+def last_record(buf, marker, rtype):
+    """Last JSON line in buf that contains marker and has type rtype. Searches the raw bytes backwards, so
+    only matching lines are decoded (decoding and splitting whole tails peaked at 150 MB)."""
+    end = len(buf)
+    while (i := buf.rfind(marker, 0, end)) != -1:
+        start = buf.rfind(b'\n', 0, i) + 1
+        stop = buf.find(b'\n', i)
+        try:
+            rec = json.loads(buf[start:stop if stop != -1 else len(buf)])
+            if rec.get('type') == rtype:
+                return rec
+        except ValueError:  # the tail's first line may be cut off
+            pass
+        end = start
+    return None
+
+
 def transcript_info(session_id):
     """(title, time of your last message) from the end of a Claude transcript. The title is the latest
     rename, else the latest AI title. Rows sort on your last message, like Codex's recency_at, so agent
@@ -175,23 +210,14 @@ def transcript_info(session_id):
     for span in (512 * 1024, 8 * 1024 * 1024):
         with open(paths[0], 'rb') as fh:
             fh.seek(max(0, size - span))
-            tail = fh.read().decode('utf-8', 'ignore')
-        for text in tail.splitlines():
-            if '-title"' not in text and '"kind":"human"' not in text:
-                continue
-            try:
-                rec = json.loads(text)
-            except ValueError:
-                continue
-            if rec.get('type') == 'custom-title':
-                custom = rec.get('customTitle')
-            elif rec.get('type') == 'ai-title':
-                ai = rec.get('aiTitle')
-            elif rec.get('type') == 'user' and (rec.get('origin') or {}).get('kind') == 'human':
-                sent = rec.get('timestamp')
+            tail = fh.read()
+        custom = custom or last_record(tail, b'"type":"custom-title"', 'custom-title')
+        ai = ai or last_record(tail, b'"type":"ai-title"', 'ai-title')
+        human = last_record(tail, b'"origin":{"kind":"human"}', 'user')
+        sent = human.get('timestamp') if human else None
         if sent or span >= size:
             break
-    return custom or ai, epoch(sent) if sent else None
+    return (custom or {}).get('customTitle') or (ai or {}).get('aiTitle'), epoch(sent) if sent else None
 
 
 def epoch(iso):
@@ -199,12 +225,14 @@ def epoch(iso):
 
 
 def claude_cli_rows(procs, gtty):
-    tty_of = {p['pid']: p['tty'] for p in procs}
-    attach_tty = {}
+    proc = {p['pid']: p for p in procs}
+    attached = {}  # job name/id -> where its `claude attach` runs
     for p in procs:
         m = re.search(r'\bclaude\b.*\battach\s+(\S+)', p['args'])
-        if m and p['tty'] in gtty:
-            attach_tty[m.group(1)] = p['tty']
+        if m and p['tty'] != '/dev/??':
+            target = focus_target(p, gtty, proc)
+            if target:
+                attached[m.group(1)] = target
 
     live, busy_jobs = [], set()
     for f in glob.glob(f'{HOME}/.claude/sessions/*.json'):
@@ -236,9 +264,9 @@ def claude_cli_rows(procs, gtty):
         # state.json lags a reply (stays 'blocked' until the next summary); a busy live session wins, as in `claude agents`
         state = 'working' if jid in busy_jobs else {'blocked': 'needs you'}.get(d.get('state'), d.get('state') or '')
         title = d.get('name') or d.get('displayIntent') or d.get('intent') or jid
-        tty = next((attach_tty[k] for k in (jid, d.get('name'), d.get('sessionId')) if k in attach_tty), None)
-        if tty:
-            rows.append(row(jid, ts, 'claude-bg', state, title, d.get('detail') or '', 'focus', tty))
+        target = next((attached[k] for k in (jid, d.get('name'), d.get('sessionId')) if k in attached), None)
+        if target:
+            rows.append(row(jid, ts, 'claude-bg', state, title, d.get('detail') or '', *target))
         else:
             rows.append(row(jid, ts, 'claude-bg', state, title, d.get('detail') or '', 'tab',
                             f'claude attach {jid}', d.get('cwd') or HOME))
@@ -252,13 +280,11 @@ def claude_cli_rows(procs, gtty):
         t_title, sent = transcript_info(d['sessionId'])
         ts = sent or (d.get('updatedAt') or d.get('startedAt') or 0) / 1000
         state = 'working' if d.get('status') == 'busy' else ''
-        tty = tty_of.get(d['pid'])
         title = d.get('name') if d.get('nameSource') == 'user' else None
         title = title or t_title or d.get('name') or d['sessionId']
-        if tty in gtty:
-            rows.append(row(d['sessionId'], ts, 'claude-cli', state, title, d.get('cwd', ''), 'focus', tty))
-        else:  # outside Ghostty (e.g. Warp) there is no way to pick the tab
-            rows.append(row(d['sessionId'], ts, 'claude-cli', state, title, d.get('cwd', ''), 'none', ''))
+        target = focus_target(proc[d['pid']], gtty, proc) if d['pid'] in proc else None
+        # other terminals (Terminal.app, iTerm2, ...) aren't supported yet: the row shows but doesn't jump
+        rows.append(row(d['sessionId'], ts, 'claude-cli', state, title, d.get('cwd', ''), *(target or ('none', ''))))
         rows[-1].update(active=(d.get('updatedAt') or d.get('startedAt') or 0) / 1000,
                         created=(d.get('startedAt') or 0) / 1000)
     return rows
@@ -276,14 +302,32 @@ GHOSTTY_TAB = '''on run argv
         set cfg to new surface configuration
         set initial working directory of cfg to (item 1 of argv)
         set initial input of cfg to (item 2 of argv) & linefeed
-        if (count of windows) is 0 then
-            new window with configuration cfg
-        else
-            new tab in front window with configuration cfg
-        end if
+        new window with configuration cfg
         activate
     end tell
 end run'''
+
+
+def new_session_terminal():
+    """Terminal for a session that isn't open anywhere: the one you were just in (the island never takes
+    focus), else whichever is running (Ghostty first), else Ghostty."""
+    front = run(['lsappinfo', 'info', '-only', 'name', run(['lsappinfo', 'front']).strip()])
+    for app in ('Warp', 'Ghostty'):
+        if f'"{app}"' in front:
+            return app
+    if run(['pgrep', '-x', 'ghostty']):
+        return 'Ghostty'
+    return 'Warp' if run(['pgrep', '-f', '/Applications/Warp.app/Contents/MacOS/stable$']) else 'Ghostty'
+
+
+def warp_open(cwd, command):
+    """Open a Warp tab in cwd running command. The URI scheme can't run commands; a Tab Config can, and Warp
+    re-reads the file on every open (https://docs.warp.dev/terminal/sessions/tab-configs). A new window
+    would also get an empty default tab, so this opens a tab in the front Warp window."""
+    with open(f'{HOME}/.warp/tab_configs/threadisland.toml', 'w') as fh:
+        fh.write('name = "ThreadIsland"\n\n[[panes]]\nid = "main"\ntype = "terminal"\n'
+                 f'directory = {json.dumps(cwd)}\ncommands = [{json.dumps(command)}]\n')
+    subprocess.run(['open', 'warp://tab_config/threadisland'])
 
 
 def jump(r):
@@ -292,7 +336,10 @@ def jump(r):
     elif r['action'] == 'focus':
         subprocess.run(['osascript', '-', r['arg']], input=GHOSTTY_FOCUS, text=True)
     elif r['action'] == 'tab':
-        subprocess.run(['osascript', '-', r['cwd'] or HOME, r['arg']], input=GHOSTTY_TAB, text=True)
+        if new_session_terminal() == 'Warp':
+            warp_open(r['cwd'] or HOME, r['arg'])
+        else:
+            subprocess.run(['osascript', '-', r['cwd'] or HOME, r['arg']], input=GHOSTTY_TAB, text=True)
 
 
 def sectioned(rows):

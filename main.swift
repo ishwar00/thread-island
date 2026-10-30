@@ -315,11 +315,12 @@ final class Island: NSObject {
         layout()
         panel.orderFrontRegardless()
         store.refresh()
-        // ponytail: polls the script (~0.5s CPU per run): every 4s while open, every 12s collapsed (for the counts)
+        // ponytail: polls the script (~0.25 s CPU per run): every 4 s while open, every 32 s collapsed, where it
+        // only keeps the two counts current (opening the island refreshes right away)
         Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.ticks += 1
-            if self.expanded || self.ticks % 3 == 0 { self.store.refresh() }
+            if self.expanded || self.ticks % 8 == 0 { self.store.refresh() }
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in self?.layout() }

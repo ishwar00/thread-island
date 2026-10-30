@@ -29,12 +29,18 @@ Codex's own activity view orders them.
 | Source | Read from | Click |
 |---|---|---|
 | Codex app | `~/.codex/state_*.sqlite` + the thread's rollout file (status, last reply) | `codex://threads/<id>` |
-| Codex CLI | same | focuses its Ghostty tab, else a new tab running `codex resume <id>` |
+| Codex CLI | same | focuses its Ghostty window or Warp tab, else `codex resume <id>` in a new session (see below) |
 | Claude desktop (Code tab) | `~/Library/Application Support/Claude/claude-code-sessions` | `claude://code/continue?session=<id>` |
-| Claude Code background jobs | `~/.claude/jobs/*/state.json` + live `~/.claude/sessions` | focuses the Ghostty tab it is attached in, else `claude attach <id>` in a new tab |
-| Claude Code CLI sessions | `~/.claude/sessions` | focuses its Ghostty tab |
+| Claude Code background jobs | `~/.claude/jobs/*/state.json` + live `~/.claude/sessions` | focuses the Ghostty window or Warp tab it is attached in, else `claude attach <id>` in a new session (see below) |
+| Claude Code CLI sessions | `~/.claude/sessions` | focuses its Ghostty window or Warp tab |
 
-Ghostty tabs are found by TTY through Ghostty's AppleScript dictionary (Ghostty 1.3+).
+Ghostty terminals are found by TTY through Ghostty's AppleScript dictionary (Ghostty 1.3+). Warp tabs are
+found by the `WARP_FOCUS_URL` (`warp://session/<id>`) Warp puts in every session's environment, read only
+from sessions that Warp itself started.
+
+A new session opens in the terminal you were just using: a Ghostty window, or a Warp tab (through a
+Warp Tab Config, `~/.warp/tab_configs/threadisland.toml`, since Warp's URLs can't run a command). If you
+were in neither, it uses whichever is running, Ghostty first.
 
 ## Install
 
@@ -54,7 +60,7 @@ Right-click the island to quit.
 
 `threads` (Python, standard library only) gathers every source into one JSON list, and `threads --jump`
 opens one row. `main.swift` is only the UI: a borderless panel at the notch that runs `threads` every
-12 s (every 4 s while open). It never pops up on its own: you look when you want to.
+32 s (every 4 s while open, and right away when you open it). It never pops up on its own: you look when you want to.
 
 Run `threads` yourself to see the raw data.
 
@@ -64,4 +70,4 @@ Run `threads` yourself to see the raw data.
   tells you when.
 - Codex records when a turn starts and ends, but not when it waits for your approval, so Codex threads
   show as working, never as "needs you". A turn with no writes for 10 minutes stops counting as working.
-- Terminals other than Ghostty have no way to focus a given tab, so live sessions there can't be jumped to.
+- Live sessions in terminals other than Ghostty and Warp show in the list but can't be jumped to.
