@@ -74,6 +74,18 @@ final class Store: ObservableObject {
         }
     }
 
+    // Priority as you left it after a drag: shown right away, then saved so refreshes keep it
+    func saveOrder(_ keys: [String]) {
+        let rank = Dictionary(uniqueKeysWithValues: keys.enumerated().map { ($1, $0) })
+        let priority = rows.filter { $0.section == "Priority" }.sorted { (rank[$0.key] ?? .max) < (rank[$1.key] ?? .max) }
+        rows = priority + rows.filter { $0.section != "Priority" }
+        guard let payload = try? JSONSerialization.data(withJSONObject: ["keys": keys]) else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = runThreads(["--edit"], input: payload)
+            DispatchQueue.main.async { self.refresh() }
+        }
+    }
+
     var needsYou: Int { rows.filter { $0.state == "needs you" }.count }
     var working: Int { rows.filter { $0.state == "working" }.count }
 }
@@ -148,6 +160,11 @@ struct IslandView: View {
     let onPick: (Row) -> Void
 
     var design: Design { Design.named(designName) }
+    @State private var dragKey: String?
+    @State private var dragOrder: [String]?
+    @State private var dragShift: CGFloat = 0
+    @State private var dragMoved: CGFloat = 0
+    @State private var rowHeight: CGFloat = 0
 
     var body: some View {
         let size = state.expanded ? full : collapsed
@@ -162,13 +179,15 @@ struct IslandView: View {
         .frame(width: size.width, height: size.height, alignment: .top)
         .background(.black)
         .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: radius, bottomTrailingRadius: radius))
-        .contextMenu {
-            Picker("Design", selection: $designName) {
-                ForEach(Design.all, id: \.name) { Text($0.name).tag($0.name) }
-            }
-            Button("Quit ThreadIsland") { NSApp.terminate(nil) }
-        }
+        .contextMenu { islandMenu }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    @ViewBuilder var islandMenu: some View {
+        Picker("Design", selection: $designName) {
+            ForEach(Design.all, id: \.name) { Text($0.name).tag($0.name) }
+        }
+        Button("Quit ThreadIsland") { NSApp.terminate(nil) }
     }
 
     @ViewBuilder var badgeWings: some View {
@@ -205,18 +224,63 @@ struct IslandView: View {
                 if store.rows.isEmpty && store.errors.isEmpty {
                     Text("All quiet.").font(design.small).foregroundStyle(design.detail).padding(16)
                 }
-                ForEach(Array(store.rows.enumerated()), id: \.element.id) { i, row in
-                    if i == 0 || store.rows[i - 1].section != row.section {
+                let rows = shownRows
+                ForEach(Array(rows.enumerated()), id: \.element.id) { i, row in
+                    if i == 0 || rows[i - 1].section != row.section {
                         Text(row.section).font(design.header)
                             .foregroundStyle(row.section == "Priority" ? design.text : design.detail)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 12).padding(.top, i == 0 ? 4 : 16).padding(.bottom, 4)
                     }
-                    RowView(row: row, design: design).onTapGesture { onPick(row) }
+                    let dragging = dragKey == row.key
+                    RowView(row: row, design: design, dragging: dragging,
+                            reorder: row.section == "Priority" ? DragGesture(minimumDistance: 1, coordinateSpace: .named("list"))
+                                .onChanged { drag(row.key, $0.translation.height) }
+                                .onEnded { _ in drop() } : nil)
+                        .onTapGesture { onPick(row) }
+                        .offset(y: dragging ? dragShift : 0)
+                        .zIndex(dragging ? 1 : 0)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { rowHeight = $0 }
                 }
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 8)
+            .coordinateSpace(.named("list"))
+        }
+    }
+
+    // Dragging a Priority row by its grip: the others slide aside as it passes their midpoint
+    var shownRows: [Row] {
+        guard let dragOrder else { return store.rows }
+        let rank = Dictionary(uniqueKeysWithValues: dragOrder.enumerated().map { ($1, $0) })
+        let priority = store.rows.filter { $0.section == "Priority" }.sorted { (rank[$0.key] ?? .max) < (rank[$1.key] ?? .max) }
+        return priority + store.rows.filter { $0.section != "Priority" }
+    }
+
+    func drag(_ key: String, _ dy: CGFloat) {
+        if dragKey == nil {
+            dragKey = key
+            dragOrder = store.rows.filter { $0.section == "Priority" }.map(\.key)
+            dragMoved = 0
+        }
+        guard var order = dragOrder, var at = order.firstIndex(of: key), rowHeight > 0 else { return }
+        var shift = dy - dragMoved
+        while shift > rowHeight / 2 && at < order.count - 1 {
+            order.swapAt(at, at + 1); at += 1; dragMoved += rowHeight; shift -= rowHeight
+        }
+        while shift < -rowHeight / 2 && at > 0 {
+            order.swapAt(at, at - 1); at -= 1; dragMoved -= rowHeight; shift += rowHeight
+        }
+        if order != dragOrder { withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) { dragOrder = order } }
+        dragShift = shift
+    }
+
+    func drop() {
+        if let dragOrder, dragOrder != store.rows.filter({ $0.section == "Priority" }).map(\.key) {
+            store.saveOrder(dragOrder)
+        }
+        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+            dragKey = nil; dragOrder = nil; dragShift = 0
         }
     }
 }
@@ -224,6 +288,8 @@ struct IslandView: View {
 struct RowView: View {
     let row: Row
     let design: Design
+    var dragging = false
+    var reorder: _EndedGesture<_ChangedGesture<DragGesture>>?  // Priority rows: drag the grip to move
     @State private var hover = false
 
     var inTerminal: Bool { row.src.hasSuffix("-cli") || row.src == "claude-bg" }
@@ -276,9 +342,22 @@ struct RowView: View {
                 }
             }
             Spacer(minLength: 0)
+            if let reorder {  // six-dot grip, shown on hover only, so the list stays still
+                Grid(horizontalSpacing: 2, verticalSpacing: 2) {
+                    ForEach(0..<3, id: \.self) { _ in
+                        GridRow { Circle().frame(width: 2, height: 2); Circle().frame(width: 2, height: 2) }
+                    }
+                }
+                .foregroundStyle(design.detail)
+                .frame(width: 20, height: 32).contentShape(Rectangle())
+                .opacity(hover || dragging ? 1 : 0)
+                .gesture(reorder)
+                .onTapGesture {}  // a click on the grip isn't a click on the thread
+            }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: 10).fill(design.text.opacity(hover ? 0.08 : 0)))
+        .background(RoundedRectangle(cornerRadius: 10).fill(design.text.opacity(dragging ? 0.14 : hover ? 0.08 : 0)))
+        .background(RoundedRectangle(cornerRadius: 10).fill(dragging ? Color.black : .clear))  // covers rows it passes
         .contentShape(Rectangle())
         .onHover { hover = $0 }
     }

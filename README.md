@@ -13,9 +13,12 @@ Codex's own activity view orders them.
   the right side counts threads that are working.
 - **Expanded (hover):** a **Priority** section first, then **Today**, **Yesterday** and one section per
   weekday for the last 7 days. Rows never swap places, so positions stay where you learned them:
-  - **Priority** holds threads with any activity (yours or the agent's) in the last 2 hours, in the
-    order their current run of activity began. A thread that becomes active, new or old, joins at the
-    bottom; after 2 hours with no activity, whatever its state, it drops into its day.
+  - **Priority** holds threads with conversation activity (yours or the agent's) in the last 2 hours.
+    A thread that becomes active, new or old, joins at the bottom; after 2 hours with no activity,
+    whatever its state, it drops into its day. Bookkeeping the apps write into idle threads and Codex's
+    scheduled automation turns don't count as activity.
+  - **Rearrange:** hover a Priority row and drag its six-dot grip (right edge) to move it. Your order is kept in
+    `~/Library/Application Support/ThreadIsland/state.json`; threads that join still go to the bottom.
   - **Day sections** sort by when you last sent a message.
 
   Each row starts with the app icon, so you can scan for "the Codex one", and shows its age.

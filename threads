@@ -7,7 +7,9 @@ live interactive Claude CLI sessions (~/.claude/sessions).
 Jumps: codex:// and claude:// deep links, Ghostty AppleScript (focus tab by tty,
 or open a new window running the resume command). `--jump` reads one row's JSON on stdin.
 """
+import contextlib
 import datetime
+import fcntl
 import glob
 import json
 import os
@@ -120,6 +122,14 @@ def line_time(line, last):
         return None
 
 
+def is_activity(line, claude):
+    """Conversation records only: not the bookkeeping both tools write into idle threads (Claude's system
+    notices and bridge records, Codex's settings sync when the app loads a thread)."""
+    if claude:
+        return b'"type":"user"' in line or b'"type":"assistant"' in line
+    return (b'"type":"response_item"' in line or b'"type":"event_msg"' in line) and b'"thread_settings_applied"' not in line
+
+
 def loads(line):
     try:
         return json.loads(line)
@@ -140,16 +150,34 @@ def scan_log(kind, path, sent=False, title=False):
     need_run, need_sent, need_title, need_turn, need_ask = True, sent, title, not claude, not claude
     run_start = ai = None
     scanned = 0
+    turn_times = []  # Codex: activity times newer than the last task_started seen, kept until we know who started it
+
+    def feed(t):
+        nonlocal need_run, run_start
+        if 'active' not in out:
+            out['active'] = t
+            need_run = NOW - t < IDLE_OUT
+        elif run_start - t >= IDLE_OUT:
+            out['entered'], need_run = run_start, False
+        run_start = t if need_run else run_start
+
     for line in lines_back(path):
         scanned += len(line) + 1
-        t = line_time(line, claude)
-        if t is not None and need_run:
-            if 'active' not in out:
-                out['active'] = t
-                need_run = NOW - t < IDLE_OUT
-            elif run_start - t >= IDLE_OUT:
-                out['entered'], need_run = run_start, False
-            run_start = t if need_run else run_start
+        if need_run and is_activity(line, claude):
+            t = line_time(line, claude)
+            if t is not None:
+                if claude:
+                    feed(t)
+                else:
+                    turn_times.append(t)
+        if need_run and not claude and b'"task_started"' in line:
+            payload = loads(line).get('payload') or {}
+            trigger = (payload.get('turn_attribution') or {}).get('turn_trigger') or ''
+            # a scheduled automation turn runs on its own, sometimes for hours; it isn't you working on the thread
+            for t in ([] if trigger.startswith('automation') else turn_times):
+                if need_run:
+                    feed(t)
+            turn_times = []
         if need_sent and b'"kind":"human"' in line:
             rec = loads(line)
             if rec.get('type') == 'user' and (rec.get('origin') or {}).get('kind') == 'human':
@@ -177,6 +205,9 @@ def scan_log(kind, path, sent=False, title=False):
                 out['asked'], need_ask = plain(questions[0].get('title') or questions[0].get('question') or '') or 'Asked you a question', False
         if not (need_run or need_sent or need_title or need_turn or need_ask):
             break
+    for t in turn_times:  # before the first turn started
+        if need_run:
+            feed(t)
     if need_run and run_start is not None:  # the run reaches back to the first entry
         out['entered'] = run_start
     if not out.get('title'):
@@ -201,7 +232,8 @@ def codex_turn(turn, rollout, asked=None):
 
 def logged(r, log, fallback_active):
     """Fill a row's activity fields from its log, falling back to the source's own timestamps."""
-    r['active'] = log.get('active') or fallback_active
+    # a log with no conversation records in reach has no activity; the source's own times include bookkeeping
+    r['active'] = log.get('active', 0) if log else fallback_active
     if log.get('entered'):
         r['entered'] = log['entered']
     return r
@@ -366,6 +398,10 @@ def claude_cli_rows(procs, gtty, sessions):
         # agent-view windows aren't threads; the jobs they show are listed above
         if d.get('sessionId') in seen or d.get('parkedJobId'):
             continue
+        # a headless `claude -p` another agent started (e.g. a review peer) has no window to jump to
+        p = proc.get(d['pid'])
+        if (d.get('entrypoint') or '').startswith('sdk') and (not p or p['tty'] == '/dev/??'):
+            continue
         try:
             path = transcript_path(d['sessionId'])
             log = scan_log('claude', path, sent=True, title=True) if path else {}
@@ -455,17 +491,55 @@ def jump(r):
     return None
 
 
+STATE = f'{HOME}/Library/Application Support/ThreadIsland/state.json'
+
+
+@contextlib.contextmanager
+def edited_state():
+    """Priority's order: 'order' is its keys, top first, so a row you dragged keeps its place.
+    Locked, so a refresh pruning it can't undo a drag saved at the same moment; written only if changed."""
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE + '.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            state = json.load(open(STATE))
+        except (OSError, ValueError):
+            state = {}
+        state.setdefault('order', [])
+        state.pop('removed', None)  # from a removed feature
+        before = json.dumps(state, sort_keys=True)
+        yield state
+        if json.dumps(state, sort_keys=True) != before:
+            with open(STATE + '.tmp', 'w') as fh:
+                json.dump(state, fh)
+            os.replace(STATE + '.tmp', STATE)
+
+
+def edit(e):
+    """Save Priority's order after you drag a row: keys, top first, as you left them."""
+    with edited_state() as state:
+        state['order'] = [k for k in e['keys'] if isinstance(k, str)]
+
+
 def sectioned(rows):
-    """Positions are learned, so rows never swap, and nothing needs remembering between runs:
+    """Positions are learned, so rows never swap on their own:
     Priority holds threads with activity in the last 2 h, in the order their current run of activity began,
     so a thread that becomes active (new or not) joins at the bottom. A thread leaves after 2 h with no
     activity, whatever its state, which is also what ends a run, so its slot can't change while it stays.
     Day sections sort by your last message, which can't change there: a new message makes a thread active,
-    and it moves to Priority."""
+    and it moves to Priority.
+    The order is saved, so a row you drag keeps its place."""
     def hot(r):
         return NOW - r.get('active', 0) < IDLE_OUT
-    priority = sorted((r for r in rows if hot(r)),
-                      key=lambda r: r.get('entered') or r.get('created') or r['ts'])
+    with edited_state() as state:
+        natural = sorted((r for r in rows if hot(r)), key=lambda r: r.get('entered') or r.get('created') or r['ts'])
+        # threads keep their slot while in Priority; one that leaves loses it, and any that join (new or back
+        # after idle) go below the rest, in the order they began
+        keys = {r['key'] for r in natural}
+        kept = [k for k in state['order'] if k in keys]
+        state['order'] = kept + [r['key'] for r in natural if r['key'] not in set(kept)]
+        rank = {k: i for i, k in enumerate(state['order'])}
+        priority = sorted(natural, key=lambda r: rank[r['key']])
     # the 7-day window applies to sort time (your last message), which can be older than a source's file mtime
     recent = sorted((r for r in rows if not hot(r) and r['ts'] >= CUTOFF), key=lambda r: -r['ts'])
     for r in priority:
@@ -484,6 +558,10 @@ def main():
         except Exception as e:  # noqa: BLE001 - shown in the panel
             error = f'{type(e).__name__}: {e}'
         json.dump({'error': error}, sys.stdout)
+        return
+
+    if '--edit' in sys.argv:
+        edit(json.load(sys.stdin))
         return
 
     procs = processes()
